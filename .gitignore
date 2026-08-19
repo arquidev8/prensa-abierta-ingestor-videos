@@ -1,0 +1,27 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Environment Variables
+.env
+.env*.local
+
+# Go
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+services/engine/data/videos/
+services/engine/data/temp_*
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

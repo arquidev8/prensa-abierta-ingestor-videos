@@ -1,0 +1,11 @@
+{
+  "name": "prensa-abierta-ingestor-videos",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev:web": "npm --prefix apps/web run dev",
+    "build:web": "npm --prefix apps/web run build",
+    "dev:engine": "powershell -Command \"cd services/engine; go run cmd/server/main.go\"",
+    "build:engine": "powershell -Command \"cd services/engine; go build -o bin/server.exe cmd/server/main.go\""
+  }
+}
