@@ -28,6 +28,9 @@ export async function fetchProcessedNews(): Promise<ProcessedNews[]> {
 
 export async function triggerManualPoll(): Promise<{ message: string }> {
   const res = await fetch(`${ENGINE_URL}/api/news/poll`, { method: 'POST' });
+  if (!res.ok) {
+    throw new Error(`Go Engine respondió ${res.status} al iniciar el sondeo manual`);
+  }
   return await res.json();
 }
 
@@ -37,6 +40,9 @@ export async function saveProcessedNews(item: Partial<ProcessedNews>): Promise<P
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(item),
   });
+  if (!res.ok) {
+    throw new Error(`Go Engine respondió ${res.status} al guardar la noticia procesada`);
+  }
   return await res.json();
 }
 
@@ -52,11 +58,17 @@ export async function requestVideoRender(payload: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
+  if (!res.ok) {
+    throw new Error(`Go Engine respondió ${res.status} al encolar el render de video`);
+  }
   return await res.json();
 }
 
 export async function checkVideoJob(jobId: string): Promise<VideoJob> {
   const res = await fetch(`${ENGINE_URL}/api/video/jobs/${jobId}`);
+  if (!res.ok) {
+    throw new Error(`Go Engine respondió ${res.status} al consultar el trabajo de video`);
+  }
   return await res.json();
 }
 
@@ -65,8 +77,14 @@ export async function fetchMediaItems(category?: string, type?: string): Promise
   if (category) params.append('category', category);
   if (type) params.append('type', type);
 
-  const res = await fetch(`${ENGINE_URL}/api/media?${params.toString()}`);
-  if (!res.ok) return [];
-  const data = await res.json();
-  return data.items || [];
+  try {
+    const res = await fetch(`${ENGINE_URL}/api/media?${params.toString()}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.items || [];
+  } catch (err) {
+    // No debe tumbar el pipeline: sin banco de medios se usa la imagen de la noticia original
+    console.error('Error al consultar Go Engine (media items):', err);
+    return [];
+  }
 }
