@@ -57,3 +57,10 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+
+# TypeScript build artifacts
+*.tsbuildinfo
+
+# Other
+.agents
+.doc
