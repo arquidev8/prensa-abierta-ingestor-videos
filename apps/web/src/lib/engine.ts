@@ -1,6 +1,10 @@
 import { RawNews, ProcessedNews, VideoJob, MediaItem } from './types';
 
-const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
+// Este módulo solo corre en el servidor: usa ENGINE_INTERNAL_URL (sin prefijo NEXT_PUBLIC_)
+// porque las variables NEXT_PUBLIC_* se incrustan en build-time en TODO el bundle,
+// incluido el código de servidor, y por eso no sirven para un valor distinto en runtime.
+const ENGINE_URL =
+  process.env.ENGINE_INTERNAL_URL || process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
 
 export async function fetchRawNews(): Promise<RawNews[]> {
   try {

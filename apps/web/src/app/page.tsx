@@ -32,6 +32,8 @@ import VideoPlayerPreview from '@/components/VideoPlayerPreview';
 import StructuredArticleReader from '@/components/StructuredArticleReader';
 import { calculateViralTrendScore } from '@/lib/trends';
 
+const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
+
 export default function FeedPage() {
   const [rawNews, setRawNews] = useState<RawNews[]>([]);
   const [processedNews, setProcessedNews] = useState<ProcessedNews[]>([]);
@@ -108,12 +110,12 @@ export default function FeedPage() {
   const fetchNews = async () => {
     try {
       setLoading(true);
-      const resRaw = await fetch('http://localhost:8085/api/news/raw', { cache: 'no-store' });
+      const resRaw = await fetch(`${ENGINE_URL}/api/news/raw`, { cache: 'no-store' });
       if (resRaw.ok) {
         const data = await resRaw.json();
         setRawNews(data.items || []);
       }
-      const resProc = await fetch('http://localhost:8085/api/news/processed', { cache: 'no-store' });
+      const resProc = await fetch(`${ENGINE_URL}/api/news/processed`, { cache: 'no-store' });
       if (resProc.ok) {
         const data = await resProc.json();
         setProcessedNews(data.items || []);
@@ -133,7 +135,10 @@ export default function FeedPage() {
 
   const handleManualPoll = async () => {
     try {
-      await fetch('http://localhost:8085/api/news/poll', { method: 'POST' });
+      const res = await fetch(`${ENGINE_URL}/api/news/poll`, { method: 'POST' });
+      if (!res.ok) {
+        throw new Error(`No se pudo iniciar el sondeo (${res.status})`);
+      }
       setTimeout(fetchNews, 2000);
     } catch (e) {
       console.error(e);
@@ -248,7 +253,7 @@ export default function FeedPage() {
       content_html: editedContent,
     };
     try {
-      await fetch('http://localhost:8085/api/news/processed', {
+      await fetch(`${ENGINE_URL}/api/news/processed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updated),

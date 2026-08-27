@@ -21,6 +21,8 @@ import { ProcessedNews } from '@/lib/types';
 import VideoPlayerPreview from '@/components/VideoPlayerPreview';
 import StructuredArticleReader from '@/components/StructuredArticleReader';
 
+const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
+
 export default function AutopilotHubPage() {
   const [processedList, setProcessedList] = useState<ProcessedNews[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -31,13 +33,15 @@ export default function AutopilotHubPage() {
   const fetchProcessedNews = async () => {
     try {
       setLoading(true);
-      const res = await fetch('http://localhost:8085/api/news/processed');
-      const data = await res.json();
-      if (data.success && Array.isArray(data.data)) {
-        setProcessedList(data.data);
+      const res = await fetch(`${ENGINE_URL}/api/news/processed`);
+      if (!res.ok) {
+        throw new Error(`No se pudo consultar noticias procesadas (${res.status})`);
       }
+      const data = await res.json();
+      setProcessedList(Array.isArray(data.items) ? data.items : []);
     } catch (err) {
       console.error('Error cargando noticias procesadas:', err);
+      setProcessedList([]);
     } finally {
       setLoading(false);
     }

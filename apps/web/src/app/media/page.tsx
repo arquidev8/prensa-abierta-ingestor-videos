@@ -4,6 +4,8 @@ import React, { useState, useEffect } from 'react';
 import { Video, Image as ImageIcon, Plus, FolderCheck, Tag, Upload, Play, Check, Sparkles, Film, Layers } from 'lucide-react';
 import { MediaItem } from '@/lib/types';
 
+const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
+
 export default function MediaBankPage() {
   const [items, setItems] = useState<MediaItem[]>([]);
   const [categoryVideos, setCategoryVideos] = useState<any[]>([]);
@@ -36,11 +38,11 @@ export default function MediaBankPage() {
   const fetchMedia = async () => {
     try {
       // 1. Cargar items del store
-      const res = await fetch('http://localhost:8085/api/media', { cache: 'no-store' });
+      const res = await fetch(`${ENGINE_URL}/api/media`, { cache: 'no-store' });
       let storeItems: MediaItem[] = [];
       if (res.ok) {
         const data = await res.json();
-        storeItems = data.items || [];
+        storeItems = Array.isArray(data.items) ? data.items : [];
       }
 
       // 2. Cargar videos de assets/contenido
@@ -48,9 +50,10 @@ export default function MediaBankPage() {
       if (resCat.ok) {
         const catData = await resCat.json();
         const localClips: MediaItem[] = [];
-        if (catData.categories) {
+        if (Array.isArray(catData.categories)) {
           catData.categories.forEach((folder: any) => {
-            folder.videos.forEach((v: any, index: number) => {
+            const videos = Array.isArray(folder.videos) ? folder.videos : [];
+            videos.forEach((v: any, index: number) => {
               localClips.push({
                 id: `local_${folder.name}_${index}`,
                 type: 'video',
@@ -68,10 +71,13 @@ export default function MediaBankPage() {
         setCategoryVideos(localClips);
         setItems([...localClips, ...storeItems]);
       } else {
+        setCategoryVideos([]);
         setItems(storeItems);
       }
     } catch (e) {
       console.error('Error cargando medios:', e);
+      setCategoryVideos([]);
+      setItems([]);
     }
   };
 
@@ -92,7 +98,7 @@ export default function MediaBankPage() {
     };
 
     try {
-      const res = await fetch('http://localhost:8085/api/media', {
+      const res = await fetch(`${ENGINE_URL}/api/media`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(itemPayload),
