@@ -1,27 +1,59 @@
-# Node / Next.js
+# Dependencies
 node_modules/
+**/node_modules/
+.pnp
+.pnp.js
+
+# Next.js Build & Cache
 .next/
+**/.next/
 out/
 build/
 dist/
 
-# Environment Variables
+# Next.js / Node environment variables
 .env
 .env*.local
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
-# Go
-bin/
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.log
+
+# Video files & heavy media (preserve folders with .gitkeep)
+*.mov
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.m4v
+!**/.gitkeep
+
+# Video generation outputs & temporary renders
+apps/web/public/temp_render/
+apps/web/public/generated_videos/*
+!apps/web/public/generated_videos/.gitkeep
+**/temp_render/
+
+# Go engine runtime data & compiled binaries
+services/engine/bin/
 services/engine/data/videos/
-services/engine/data/temp_*
+**/cmd/server/data/
 
-# OS / Editor files
+# OS and Editor files
 .DS_Store
 Thumbs.db
-*.log
 .vscode/
 .idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

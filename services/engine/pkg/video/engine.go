@@ -127,8 +127,15 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	req := job.Request
 	clipDuration := float64(req.DurationSec) / float64(len(req.ClipURLs))
 	if len(req.ClipURLs) == 0 {
-		// Fallback test color clip if no clip provided
-		return e.renderFallbackColorVideo(ctx, job, outputPath)
+		// Buscar si existe video de plantilla en assets/contenido según la categoría
+		catVideo := e.findCategoryTemplateVideo(req.Category)
+		if catVideo != "" {
+			req.ClipURLs = []string{catVideo}
+			clipDuration = float64(req.DurationSec)
+		} else {
+			// Fallback test color clip if no clip provided
+			return e.renderFallbackColorVideo(ctx, job, outputPath)
+		}
 	}
 
 	// Prepare temporary list for concatenation
@@ -181,15 +188,18 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	// Clean escaped headline for FFmpeg drawtext
 	cleanHeadline := sanitizeTextForFFmpeg(req.Headline)
 
-	// Drawtext overlay with banner and Prensa Abierta branding
-	// Using standard drawbox + drawtext filters
+	categoryHeader := fmt.Sprintf("ULTIMA HORA  •  %s", strings.ToUpper(req.Category))
+	if req.Category == "" {
+		categoryHeader = "ULTIMA HORA  •  NOTICIAS"
+	}
+
 	videoFilters := []string{
-		// Dark gradient at bottom for legibility
-		"drawbox=y=ih-420:color=black@0.75:width=iw:height=420:t=fill",
-		// Prensa Abierta brand tag
-		"drawtext=text='PRENSA ABIERTA':fontcolor=yellow:fontsize=38:x=60:y=h-360:box=1:boxcolor=red@0.9:boxborderw=10",
+		// Dark box at bottom for legibility
+		"drawbox=y=ih-520:color=black@0.85:width=iw:height=520:t=fill",
+		// Category header tag
+		fmt.Sprintf("drawtext=text='%s':fontcolor=0xFFAA00:fontsize=36:x=70:y=h-440", categoryHeader),
 		// Headline text wrapped
-		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=48:x=60:y=h-260:fix_bounds=true", cleanHeadline),
+		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=h-370:fix_bounds=true", cleanHeadline),
 	}
 
 	filterChain := strings.Join(videoFilters, ",")
@@ -257,3 +267,51 @@ func sanitizeTextForFFmpeg(text string) string {
 	}
 	return text
 }
+
+func (e *Engine) findCategoryTemplateVideo(category string) string {
+	contenidoDir := filepath.Join(e.assetsDir, "contenido")
+	if _, err := os.Stat(contenidoDir); err != nil {
+		return ""
+	}
+
+	catLower := strings.ToLower(category)
+	entries, err := os.ReadDir(contenidoDir)
+	if err != nil {
+		return ""
+	}
+
+	var matchedFolder string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			nameLower := strings.ToLower(entry.Name())
+			if strings.Contains(catLower, nameLower) || strings.Contains(nameLower, catLower) {
+				matchedFolder = entry.Name()
+				break
+			}
+		}
+	}
+
+	if matchedFolder == "" {
+		// Fallback a "Ahora" o primera carpeta
+		for _, entry := range entries {
+			if entry.IsDir() && strings.ToLower(entry.Name()) == "ahora" {
+				matchedFolder = entry.Name()
+				break
+			}
+		}
+	}
+
+	if matchedFolder != "" {
+		folderPath := filepath.Join(contenidoDir, matchedFolder)
+		files, _ := os.ReadDir(folderPath)
+		for _, f := range files {
+			ext := strings.ToLower(filepath.Ext(f.Name()))
+			if ext == ".mp4" || ext == ".mov" || ext == ".webm" {
+				return filepath.Join(folderPath, f.Name())
+			}
+		}
+	}
+
+	return ""
+}
+
