@@ -21,17 +21,27 @@ services:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
+      args:
+        # Usado por el bundle del navegador (build-time); debe ser la URL publicada en el host
+        NEXT_PUBLIC_ENGINE_URL: http://localhost:8080
     container_name: prensa_abierta_web
     ports:
       - "3000:3000"
     environment:
+      # Usado únicamente por el bundle del navegador; en runtime del servidor NO tiene efecto
+      # (Next.js incrusta NEXT_PUBLIC_* en build-time en todo el bundle, incluido el servidor)
       - NEXT_PUBLIC_ENGINE_URL=http://engine:8080
+      # Usado por el código de servidor (lib/engine.ts) en runtime real; DNS interno de docker
+      - ENGINE_INTERNAL_URL=http://engine:8080
       - OLLAMA_CLOUD_BASE_URL=https://api.ollama.com/v1
       - OLLAMA_CLOUD_API_KEY=${OLLAMA_CLOUD_API_KEY}
       - OLLAMA_MODEL=qwen2.5:72b
       - WP_BASE_URL=${WP_BASE_URL}
       - WP_USERNAME=${WP_USERNAME}
       - WP_APPLICATION_PASSWORD=${WP_APPLICATION_PASSWORD}
+      - PEXELS_API_KEY=${PEXELS_API_KEY}
+    volumes:
+      - ./assets:/app/assets
     depends_on:
       - engine
     restart: unless-stopped
