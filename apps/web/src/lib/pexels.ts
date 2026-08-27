@@ -13,12 +13,13 @@ export interface StockImage {
   alt: string;
 }
 
-// Fallback high-quality vertical and news clips (Puerto Rico, Capitol, Police, Press Room, Court)
+// Fallback high-quality vertical clips (Puerto Rico, Capitol, Police, Press Room, Court)
+// Nota: se evitan clips con gráficos de noticiero incrustados (ej. "BREAKING NEWS" en inglés)
 const CURATED_NEWS_CLIPS: Record<string, string[]> = {
   general: [
-    'https://assets.mixkit.co/videos/preview/mixkit-news-anchor-talking-in-a-studio-41484-large.mp4',
     'https://assets.mixkit.co/videos/preview/mixkit-busy-city-street-with-traffic-and-pedestrians-41482-large.mp4',
     'https://assets.mixkit.co/videos/preview/mixkit-hands-typing-on-a-laptop-in-an-office-41483-large.mp4',
+    'https://assets.mixkit.co/videos/preview/mixkit-drone-view-of-a-tropical-coastline-41500-large.mp4',
   ],
   politica: [
     'https://assets.mixkit.co/videos/preview/mixkit-government-building-with-columns-and-flags-41485-large.mp4',
@@ -47,17 +48,46 @@ const CURATED_NEWS_CLIPS: Record<string, string[]> = {
   ],
 };
 
+// Frases prohibidas: evitan traer b-roll con gráficos de noticiero ajenos incrustados (ej. "BREAKING NEWS")
+const BLOCKED_VIDEO_SEARCH_TERMS = [
+  'breaking news',
+  'breaking',
+  'news anchor',
+  'news studio',
+  'newsroom',
+  'anchor',
+  'studio',
+  'broadcast',
+];
+
+export function sanitizeVideoSearchQuery(query: string): string {
+  let safe = query || '';
+  BLOCKED_VIDEO_SEARCH_TERMS.forEach((term) => {
+    safe = safe.replace(new RegExp(term, 'gi'), '');
+  });
+  safe = safe.replace(/\s+/g, ' ').trim();
+  return safe || 'puerto rico ultimas noticias';
+}
+
+export function sanitizeVideoSearchTags(tags: string[]): string[] {
+  const cleaned = (tags || [])
+    .map((tag) => sanitizeVideoSearchQuery(tag))
+    .filter((tag) => tag.length > 0);
+  return cleaned.length > 0 ? cleaned : ['puerto rico', 'ultimas noticias'];
+}
+
 export async function searchPexelsVideos(
   query: string,
   category: string = 'general',
   apiKey?: string
 ): Promise<string[]> {
   const key = apiKey || process.env.PEXELS_API_KEY;
+  const safeQuery = sanitizeVideoSearchQuery(query);
 
   if (key) {
     try {
       const url = `https://api.pexels.com/videos/search?query=${encodeURIComponent(
-        query
+        safeQuery
       )}&orientation=portrait&size=medium&per_page=3`;
 
       const res = await fetch(url, {
@@ -79,7 +109,7 @@ export async function searchPexelsVideos(
             .filter(Boolean);
 
           if (clipUrls.length > 0) {
-            console.log(`[Pexels API] Se encontraron ${clipUrls.length} clips para "${query}"`);
+            console.log(`[Pexels API] Se encontraron ${clipUrls.length} clips para "${safeQuery}"`);
             return clipUrls;
           }
         }

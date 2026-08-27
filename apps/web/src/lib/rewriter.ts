@@ -28,7 +28,7 @@ export function generateAutonomousEditorial(
   // Detección de categoría inteligente
   const lower = `${cleanTitle} ${cleanRaw}`.toLowerCase();
   let category = 'Noticias';
-  let videoTags = ['puerto rico news', 'breaking news'];
+  let videoTags = ['puerto rico news', 'ultimas noticias'];
 
   if (lower.includes('concierto') || lower.includes('bad bunny') || lower.includes('bithorn') || lower.includes('música') || lower.includes('artista')) {
     category = 'Farándula';

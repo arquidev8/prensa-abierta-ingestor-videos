@@ -1,5 +1,6 @@
 import { sanitizeBrandVoice } from './sanitizer';
 import { generateAutonomousEditorial } from './rewriter';
+import { sanitizeVideoSearchTags } from './pexels';
 
 export interface EditorialRewriteResult {
   title: string;
@@ -63,7 +64,7 @@ ESTRUCTURA DE PUBLICACIÓN REQUERIDA:
 2. RAMA REDES SOCIALES & VIDEO VERTICAL (Reels / TikTok / Shorts):
    - VIDEO HEADLINE: Titular de impacto visual de máximo 10-12 palabras para el rótulo del video 9:16.
    - VIDEO CAPTION: Resumen de 1-2 oraciones para el copy de redes sociales.
-   - VIDEO SEARCH TAGS: 3 a 5 palabras clave de búsqueda de video.
+   - VIDEO SEARCH TAGS: 3 a 5 palabras clave de búsqueda de video que describan ÚNICAMENTE elementos visuales neutros (paisajes, objetos, acciones, lugares de Puerto Rico). PROHIBIDO usar "breaking news", "news anchor", "news studio", "broadcast" o cualquier frase que traiga b-roll con gráficos de noticiero ajenos incrustados.
 
 DEBES RESPONDER EXCLUSIVAMENTE EN FORMATO JSON VÁLIDO CON ESTA ESTRUCTURA EXACTA:
 {
@@ -136,9 +137,10 @@ Genera la redacción editorial para Prensa Abierta en formato JSON.`;
       content_html: sanitizeBrandVoice(formattedHtml),
       category: parsed.category || 'Noticias',
       tags: Array.isArray(parsed.tags) ? parsed.tags : ['Puerto Rico', 'Noticias'],
-      video_search_tags: Array.isArray(parsed.video_search_tags)
-        ? parsed.video_search_tags
-        : ['puerto rico news'],
+      // Guardrail: sanea los tags aunque la IA ignore la instrucción del prompt
+      video_search_tags: sanitizeVideoSearchTags(
+        Array.isArray(parsed.video_search_tags) ? parsed.video_search_tags : ['puerto rico', 'ultimas noticias']
+      ),
       suggested_image_concept: parsed.suggested_image_concept || 'Noticia de Puerto Rico',
     };
   } catch (error) {
