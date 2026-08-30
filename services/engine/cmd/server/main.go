@@ -1,11 +1,11 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -41,12 +41,24 @@ func main() {
 	store := storage.NewStore(dataDir)
 
 	// Initialize Video Engine
-	videoEngine := video.NewEngine(os.Getenv("FFMPEG_PATH"), assetsDir, outputVideosDir)
+	videoWorkers := 2
+	if raw := os.Getenv("VIDEO_RENDER_WORKERS"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			videoWorkers = n
+		} else {
+			log.Printf("[Warning] VIDEO_RENDER_WORKERS inválido ('%s'), usando default %d", raw, videoWorkers)
+		}
+	}
+
+	videoEngine := video.NewEngine(os.Getenv("FFMPEG_PATH"), assetsDir, outputVideosDir, videoWorkers)
 	if err := videoEngine.CheckFFmpegAvailability(); err != nil {
 		log.Printf("[Warning] FFmpeg check: %v (los renders usarán generador interno o fallback)", err)
 	} else {
 		log.Println("[VideoEngine] ✅ FFmpeg detectado y listo para renderizado.")
 	}
+
+	// Start the bounded worker pool that processes queued render jobs
+	videoEngine.StartWorkers()
 
 	// Initialize Scraper Poller for Puerto Rico
 	sources := scraper.GetDefaultPRSources()
@@ -150,12 +162,15 @@ func main() {
 
 		job := videoEngine.CreateJob(req)
 
-		// Run render asynchronously
-		go func(jobID string) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			_, _ = videoEngine.RenderVideo(ctx, jobID)
-		}(job.ID)
+		// Encolar el render para que lo procese el worker pool (limita cuántos
+		// FFmpeg corren en paralelo). Si la cola está llena, se rechaza con 503
+		// en vez de acumular trabajo ilimitado o tumbar el servidor.
+		if err := videoEngine.Enqueue(job.ID); err != nil {
+			return c.Status(503).JSON(fiber.Map{
+				"error":  err.Error(),
+				"job_id": job.ID,
+			})
+		}
 
 		return c.Status(202).JSON(fiber.Map{
 			"message": "Trabajo de renderizado de video encolado",
