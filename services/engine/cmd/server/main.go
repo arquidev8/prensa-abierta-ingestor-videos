@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -67,9 +69,8 @@ func main() {
 		log.Printf("[Ingestor PR] 📰 Nueva noticia guardada: [%s] %s", news.SourceName, news.Title)
 	})
 
-	// Start continuous background poller
+	// Start continuous background poller (detenido explícitamente en el shutdown ordenado más abajo)
 	poller.Start()
-	defer poller.Stop()
 
 	// Initialize Fiber Web Server
 	app := fiber.New(fiber.Config{
@@ -212,8 +213,28 @@ func main() {
 	})
 
 	addr := fmt.Sprintf(":%s", port)
-	log.Printf("🚀 Prensa Abierta Go Core Engine corriendo en http://localhost%s", addr)
-	if err := app.Listen(addr); err != nil {
-		log.Fatalf("Error iniciando servidor Go: %v", err)
+
+	// Corre el servidor en una goroutine para poder escuchar señales de
+	// apagado (Ctrl+C / docker stop) y hacer un shutdown ordenado: dejar de
+	// aceptar conexiones y, sobre todo, forzar el flush final del store
+	// (persistencia asíncrona) para no perder cambios en memoria pendientes.
+	go func() {
+		log.Printf("🚀 Prensa Abierta Go Core Engine corriendo en http://localhost%s", addr)
+		if err := app.Listen(addr); err != nil {
+			log.Fatalf("Error iniciando servidor Go: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
+
+	log.Println("[Shutdown] Señal recibida, cerrando servidor de forma ordenada...")
+	if err := app.Shutdown(); err != nil {
+		log.Printf("[Shutdown] Error al cerrar Fiber: %v", err)
 	}
+
+	poller.Stop()
+	store.Close() // fuerza el flush final de cualquier cambio pendiente a disco
+	log.Println("[Shutdown] Apagado completo.")
 }
