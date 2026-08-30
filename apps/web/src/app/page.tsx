@@ -30,14 +30,15 @@ import {
 import { RawNews, ProcessedNews } from '@/lib/types';
 import VideoPlayerPreview from '@/components/VideoPlayerPreview';
 import StructuredArticleReader from '@/components/StructuredArticleReader';
+import EngineOfflineBanner from '@/components/EngineOfflineBanner';
 import { calculateViralTrendScore } from '@/lib/trends';
-
-const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
+import { fetchFromEngine, ENGINE_URL } from '@/lib/engineClient';
 
 export default function FeedPage() {
   const [rawNews, setRawNews] = useState<RawNews[]>([]);
   const [processedNews, setProcessedNews] = useState<ProcessedNews[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [engineError, setEngineError] = useState<string | null>(null);
   const [processingId, setProcessingId] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<{ raw?: RawNews; processed?: ProcessedNews } | null>(null);
   const [autoPilot, setAutoPilot] = useState<boolean>(false);
@@ -108,23 +109,26 @@ export default function FeedPage() {
   };
 
   const fetchNews = async () => {
-    try {
-      setLoading(true);
-      const resRaw = await fetch(`${ENGINE_URL}/api/news/raw`, { cache: 'no-store' });
-      if (resRaw.ok) {
-        const data = await resRaw.json();
-        setRawNews(data.items || []);
-      }
-      const resProc = await fetch(`${ENGINE_URL}/api/news/processed`, { cache: 'no-store' });
-      if (resProc.ok) {
-        const data = await resProc.json();
-        setProcessedNews(data.items || []);
-      }
-    } catch (err) {
-      console.error('Error cargando noticias:', err);
-    } finally {
-      setLoading(false);
-    }
+    setLoading(true);
+
+    const [rawResult, procResult] = await Promise.all([
+      fetchFromEngine<{ items: RawNews[] }>('/api/news/raw', { cache: 'no-store' }),
+      fetchFromEngine<{ items: ProcessedNews[] }>('/api/news/processed', { cache: 'no-store' }),
+    ]);
+
+    if (rawResult.ok) setRawNews(rawResult.data.items || []);
+    if (procResult.ok) setProcessedNews(procResult.data.items || []);
+
+    // Solo mostramos el banner de "Engine no disponible" cuando el Engine es
+    // inalcanzable (fetch falló), no ante un simple error HTTP puntual.
+    const offlineResult = !rawResult.ok && rawResult.offline
+      ? rawResult
+      : !procResult.ok && procResult.offline
+        ? procResult
+        : null;
+    setEngineError(offlineResult ? offlineResult.error : null);
+
+    setLoading(false);
   };
 
   useEffect(() => {
@@ -338,6 +342,11 @@ export default function FeedPage() {
           </button>
         </div>
       </div>
+
+      {/* Estado explícito cuando el Go Engine no responde (evita confundirlo con "sin noticias") */}
+      {engineError && (
+        <EngineOfflineBanner message={engineError} onRetry={fetchNews} retrying={loading} />
+      )}
 
       {/* Advanced Filter Suite (Clean Light Mesh Aesthetics) */}
       <div className="p-5 rounded-3xl bg-white border border-slate-200/90 space-y-4 shadow-sm">

@@ -3,8 +3,8 @@
 import React, { useState, useEffect } from 'react';
 import { Video, Image as ImageIcon, Plus, FolderCheck, Tag, Upload, Play, Check, Sparkles, Film, Layers } from 'lucide-react';
 import { MediaItem } from '@/lib/types';
-
-const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
+import EngineOfflineBanner from '@/components/EngineOfflineBanner';
+import { fetchFromEngine, ENGINE_URL } from '@/lib/engineClient';
 
 export default function MediaBankPage() {
   const [items, setItems] = useState<MediaItem[]>([]);
@@ -13,6 +13,8 @@ export default function MediaBankPage() {
   const [selectedType, setSelectedType] = useState<string>('all');
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
   const [activePreviewUrl, setActivePreviewUrl] = useState<string | null>(null);
+  const [engineError, setEngineError] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
 
   // Form State
   const [newTitle, setNewTitle] = useState('');
@@ -36,16 +38,17 @@ export default function MediaBankPage() {
   ];
 
   const fetchMedia = async () => {
-    try {
-      // 1. Cargar items del store
-      const res = await fetch(`${ENGINE_URL}/api/media`, { cache: 'no-store' });
-      let storeItems: MediaItem[] = [];
-      if (res.ok) {
-        const data = await res.json();
-        storeItems = Array.isArray(data.items) ? data.items : [];
-      }
+    setLoading(true);
 
-      // 2. Cargar videos de assets/contenido
+    // 1. Cargar items del banco propio (Go Engine)
+    const storeResult = await fetchFromEngine<{ items: MediaItem[] }>('/api/media', { cache: 'no-store' });
+    const storeItems = storeResult.ok && Array.isArray(storeResult.data.items) ? storeResult.data.items : [];
+    // Solo marcamos el banner cuando el Engine es inalcanzable, no ante un
+    // simple error HTTP puntual (esos ya quedan logueados en consola).
+    setEngineError(!storeResult.ok && storeResult.offline ? storeResult.error : null);
+
+    // 2. Cargar videos de assets/contenido (ruta interna de Next.js, no depende del Engine)
+    try {
       const resCat = await fetch('/api/media/category-list', { cache: 'no-store' });
       if (resCat.ok) {
         const catData = await resCat.json();
@@ -75,10 +78,12 @@ export default function MediaBankPage() {
         setItems(storeItems);
       }
     } catch (e) {
-      console.error('Error cargando medios:', e);
+      console.error('Error cargando categorías de video locales:', e);
       setCategoryVideos([]);
-      setItems([]);
+      setItems(storeItems);
     }
+
+    setLoading(false);
   };
 
   useEffect(() => {
@@ -154,6 +159,11 @@ export default function MediaBankPage() {
           <span>Añadir Medio</span>
         </button>
       </div>
+
+      {/* Estado explícito cuando el Go Engine no responde (evita confundirlo con "banco vacío") */}
+      {engineError && (
+        <EngineOfflineBanner message={engineError} onRetry={fetchMedia} retrying={loading} />
+      )}
 
       {/* Filter Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-4 rounded-3xl border border-slate-200 shadow-sm">

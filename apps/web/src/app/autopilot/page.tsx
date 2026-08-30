@@ -20,31 +20,32 @@ import {
 import { ProcessedNews } from '@/lib/types';
 import VideoPlayerPreview from '@/components/VideoPlayerPreview';
 import StructuredArticleReader from '@/components/StructuredArticleReader';
-
-const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
+import EngineOfflineBanner from '@/components/EngineOfflineBanner';
+import { fetchFromEngine } from '@/lib/engineClient';
 
 export default function AutopilotHubPage() {
   const [processedList, setProcessedList] = useState<ProcessedNews[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [engineError, setEngineError] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const fetchProcessedNews = async () => {
-    try {
-      setLoading(true);
-      const res = await fetch(`${ENGINE_URL}/api/news/processed`);
-      if (!res.ok) {
-        throw new Error(`No se pudo consultar noticias procesadas (${res.status})`);
-      }
-      const data = await res.json();
-      setProcessedList(Array.isArray(data.items) ? data.items : []);
-    } catch (err) {
-      console.error('Error cargando noticias procesadas:', err);
+    setLoading(true);
+
+    const result = await fetchFromEngine<{ items: ProcessedNews[] }>('/api/news/processed');
+    if (result.ok) {
+      setProcessedList(Array.isArray(result.data.items) ? result.data.items : []);
+      setEngineError(null);
+    } else {
       setProcessedList([]);
-    } finally {
-      setLoading(false);
+      // Solo marcamos el banner cuando el Engine es inalcanzable, no ante un
+      // simple error HTTP puntual (esos ya quedan logueados en consola).
+      setEngineError(result.offline ? result.error : null);
     }
+
+    setLoading(false);
   };
 
   useEffect(() => {
@@ -147,6 +148,11 @@ export default function AutopilotHubPage() {
           </button>
         </div>
       </div>
+
+      {/* Estado explícito cuando el Go Engine no responde (evita confundirlo con "sin piezas") */}
+      {engineError && (
+        <EngineOfflineBanner message={engineError} onRetry={fetchProcessedNews} retrying={loading} />
+      )}
 
       {/* Filter & Search Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-4 rounded-3xl border border-slate-200 shadow-sm">
