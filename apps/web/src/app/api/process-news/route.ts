@@ -1,18 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { rewriteNewsWithOllamaCloud } from '@/lib/ollama';
 import { publishToWordPress } from '@/lib/wordpress';
-import { saveProcessedNews, requestVideoRender, fetchMediaItems } from '@/lib/engine';
-import { searchPexelsVideos } from '@/lib/pexels';
-import { resolveCategoryVideo } from '@/lib/contentLibrary';
+import { saveProcessedNews, fetchMediaItems } from '@/lib/engine';
 import { RawNews, ProcessedNews } from '@/lib/types';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { rawNews, autoPublishWP, generateVideo, ollamaModel } = body as {
+    const { rawNews, autoPublishWP, ollamaModel } = body as {
       rawNews: RawNews;
       autoPublishWP?: boolean;
-      generateVideo?: boolean;
       ollamaModel?: string;
     };
 
@@ -55,43 +52,16 @@ export async function POST(req: NextRequest) {
       wpUrl = wpResult.link;
     }
 
-    // 4. Generación de video 10-15s en Go Engine con clips de Pexels / Banco de Medios
-    let videoStatus: 'none' | 'rendering' | 'ready' | 'failed' = 'none';
-    let videoJobId = '';
-
-    if (generateVideo !== false) {
-      // Aislado en su propio try/catch: un fallo aquí (Engine caído, sin clips, etc.)
-      // no debe descartar la redacción ya generada ni la publicación en WordPress.
-      try {
-        // Prioridad 1: banco propio (assets/contenido), sin overlays ni gráficos de terceros
-        const ownVideo = resolveCategoryVideo(editorial.category, editorial.video_search_tags);
-        let stockClips: string[];
-
-        if (ownVideo) {
-          console.log(`[Pipeline] 4. Usando video del banco propio (categoría "${ownVideo.matchedFolder}"): ${ownVideo.fileName}`);
-          stockClips = [`${req.nextUrl.origin}${ownVideo.streamUrl}`];
-        } else {
-          console.log(`[Pipeline] 4. Sin banco propio disponible. Buscando clips en Pexels para tags: ${editorial.video_search_tags.join(', ')}`);
-          const query = editorial.video_search_tags.slice(0, 2).join(' ') || editorial.category;
-          stockClips = await searchPexelsVideos(query, editorial.category);
-        }
-
-        const renderRes = await requestVideoRender({
-          news_id: rawNews.id,
-          headline: editorial.title,
-          category: editorial.category,
-          clip_urls: stockClips,
-          duration_sec: 12,
-        });
-
-        videoJobId = renderRes.job_id;
-        videoStatus = 'rendering';
-        console.log(`[Pipeline] 🎬 Trabajo de video encolado en Go Engine: ${videoJobId} (${stockClips.length} clips)`);
-      } catch (videoError: any) {
-        console.error('[Pipeline] ⚠️ Falló la generación de video, se continúa sin video:', videoError);
-        videoStatus = 'failed';
-      }
-    }
+    // 4. El video YA NO se renderiza automáticamente aquí. Antes este paso encolaba
+    // un render "fantasma" en el Go Engine apenas se procesaba la noticia (con
+    // `generateVideo: true`), sin que ninguna parte de la UI consumiera su resultado
+    // (video_job_id/video_status se guardaban pero nada hacía polling ni lo mostraba).
+    // Eso producía un render real e independiente del que después dispara el botón
+    // "Descargar Video (.mp4)" (/api/render-video), con selección de clip aleatoria
+    // (sin seed) en vez de determinística — dos pipelines corriendo a ciegas para la
+    // misma noticia, con resultados que no coincidían entre sí. Ahora el único render
+    // por noticia es el explícito del botón de descarga.
+    const videoStatus: 'none' | 'rendering' | 'ready' | 'failed' = 'none';
 
     // 5. Guardar Noticia Procesada en Go Engine
     const processedRecord: ProcessedNews = {
@@ -122,7 +92,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       success: true,
       processed: processedRecord,
-      video_job_id: videoJobId,
       editorial,
     });
   } catch (error: any) {

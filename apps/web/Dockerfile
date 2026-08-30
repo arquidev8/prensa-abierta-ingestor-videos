@@ -22,9 +22,11 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 
-# ffmpeg es requerido por /api/render-video (lib/videoGenerator.ts)
-RUN apk add --no-cache ffmpeg
-
+# Nota: este servicio YA NO ejecuta FFmpeg directamente. El único pipeline de
+# renderizado de video es el Go Engine (services/engine); /api/render-video solo
+# resuelve el clip y delega el render real vía HTTP al Engine (ver lib/engine.ts).
+# Antes se instalaba aquí `ffmpeg` + `font-dejavu` para una reimplementación en Node
+# (lib/videoGenerator.ts) que se eliminó por duplicar ese pipeline.
 RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
 
 COPY --from=builder /app/public ./public

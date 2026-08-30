@@ -75,6 +75,10 @@ export default function FeedPage() {
   ) => {
     try {
       setIsRenderingVideo(true);
+      // Timeout defensivo del lado del cliente: el servidor ya acota su propia espera
+      // (~50s) al pollear el job del Go Engine, pero este límite adicional garantiza
+      // que el botón nunca quede "generando" para siempre ante un fallo de red, un
+      // proxy colgado, etc. — antes no existía ningún timeout en esta llamada.
       const res = await fetch('/api/render-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -85,6 +89,7 @@ export default function FeedPage() {
           imageUrl: imageUrl,
           duration: 10,
         }),
+        signal: AbortSignal.timeout(60_000),
       });
       const data = await res.json();
       if (data.success && data.videoUrl) {
@@ -100,9 +105,14 @@ export default function FeedPage() {
       } else {
         alert(data.error || 'Error al generar video');
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error('Error generando video para descarga:', e);
-      alert('Hubo un error al procesar el video con FFmpeg');
+      const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+      alert(
+        timedOut
+          ? 'El render tardó demasiado y se canceló. Intenta de nuevo en unos segundos.'
+          : 'Hubo un error al procesar el video.'
+      );
     } finally {
       setIsRenderingVideo(false);
     }
@@ -171,7 +181,6 @@ export default function FeedPage() {
         body: JSON.stringify({
           rawNews: item,
           autoPublishWP: autoPublishWP || autoPilot,
-          generateVideo: true,
           ollamaModel: selectedModel,
         }),
       });
@@ -1053,6 +1062,7 @@ export default function FeedPage() {
                     category={selectedItem.processed?.category || selectedItem.raw?.category || 'Noticias'}
                     imageFallback={selectedItem.processed?.featured_image_url || selectedItem.raw?.image_url}
                     duration={12}
+                    newsId={selectedItem.processed?.id || selectedItem.raw?.id}
                   />
                 </div>
 

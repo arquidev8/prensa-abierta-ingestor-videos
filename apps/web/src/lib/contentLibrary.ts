@@ -197,12 +197,29 @@ export function getAllCategoryFolders(): CategoryFolder[] {
   return folders;
 }
 
+// Hash simple y estable (no criptográfico) para elegir un índice determinístico
+// a partir de un string. Se usa para que, dado el mismo `seed` (ej. el id de la
+// noticia), siempre se elija el mismo clip de una carpeta con varios videos —
+// evita que el preview (que llama a esta función) y la descarga (que la vuelve
+// a llamar por separado) terminen mostrando dos clips distintos por puro azar.
+function stableHash(input: string): number {
+  let hash = 0;
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
 /**
- * Resuelve el mejor video de categoría para una noticia dada su categoría o tags
+ * Resuelve el mejor video de categoría para una noticia dada su categoría o tags.
+ * Si se provee `seed` (ej. el id de la noticia), la selección dentro de la carpeta
+ * es determinística en vez de aleatoria, para que distintas llamadas (preview,
+ * descarga) con el mismo seed obtengan siempre el mismo archivo.
  */
 export function resolveCategoryVideo(
   categoryName?: string,
-  tags?: string[]
+  tags?: string[],
+  seed?: string
 ): CategoryVideoInfo | null {
   const folders = getAllCategoryFolders();
   if (folders.length === 0) return null;
@@ -250,9 +267,12 @@ export function resolveCategoryVideo(
     return null;
   }
 
-  // Si hay más de un video, seleccionamos uno aleatoriamente para dar variedad
-  const randomIndex = Math.floor(Math.random() * targetFolder.videos.length);
-  const selectedVideo = targetFolder.videos[randomIndex];
+  // Si hay más de un video: con seed, selección determinística (mismo seed = mismo
+  // archivo siempre); sin seed, aleatoria (comportamiento histórico) para dar variedad.
+  const index = seed
+    ? stableHash(seed) % targetFolder.videos.length
+    : Math.floor(Math.random() * targetFolder.videos.length);
+  const selectedVideo = targetFolder.videos[index];
 
   return {
     category: categoryName || targetFolder.name,

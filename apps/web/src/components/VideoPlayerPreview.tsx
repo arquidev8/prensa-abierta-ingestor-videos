@@ -9,6 +9,10 @@ interface VideoPlayerPreviewProps {
   clips?: string[];
   imageFallback?: string;
   duration?: number; // total duration in seconds (default 12)
+  // Id de la noticia: hace determinística la elección del clip de categoría
+  // (vía `seed` en /api/media/category-video) para que este preview muestre
+  // exactamente el mismo b-roll que después se usa al descargar el video real.
+  newsId?: string;
 }
 
 export default function VideoPlayerPreview({
@@ -17,6 +21,7 @@ export default function VideoPlayerPreview({
   clips = [],
   imageFallback,
   duration = 12,
+  newsId,
 }: VideoPlayerPreviewProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
@@ -25,15 +30,19 @@ export default function VideoPlayerPreview({
   const [videoError, setVideoError] = useState<boolean>(false);
   const [isVideoLoaded, setIsVideoLoaded] = useState<boolean>(false);
 
-  // URL del video de la categoría en assets/contenido
-  const categoryVideoUrl = `/api/media/category-video?category=${encodeURIComponent(category)}`;
+  // URL del video de la categoría en assets/contenido. Se incluye `seed` (id de
+  // la noticia) para que la selección del clip sea determinística y coincida
+  // con la que usará la descarga real del video (ver contentLibrary.ts).
+  const categoryVideoUrl = `/api/media/category-video?category=${encodeURIComponent(category)}${
+    newsId ? `&seed=${encodeURIComponent(newsId)}` : ''
+  }`;
 
   // Imagen fallback
   const displayImage =
     imageFallback ||
     'https://images.unsplash.com/photo-1504608524841-42fe6f032b4b?w=800&auto=format&fit=crop&q=80';
 
-  // Sincronizar video cuando cambia la categoría
+  // Sincronizar video cuando cambia la categoría o la noticia (cambia el seed → clip)
   useEffect(() => {
     setVideoError(false);
     setIsVideoLoaded(false);
@@ -44,7 +53,8 @@ export default function VideoPlayerPreview({
         videoRef.current.play().catch(() => {});
       }
     }
-  }, [category]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [category, newsId]);
 
   // Manejador de reproducción con HTML5 Video
   useEffect(() => {

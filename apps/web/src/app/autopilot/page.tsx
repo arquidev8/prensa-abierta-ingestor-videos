@@ -78,6 +78,10 @@ export default function AutopilotHubPage() {
   const handleDownloadRealVideo = async (item: ProcessedNews) => {
     try {
       setRenderingId(item.id);
+      // Timeout defensivo del lado del cliente: el servidor ya acota su propia espera
+      // (~50s) al pollear el job del Go Engine, pero este límite adicional garantiza
+      // que el botón nunca quede "generando" para siempre ante un fallo de red, un
+      // proxy colgado, etc. — antes no existía ningún timeout en esta llamada.
       const res = await fetch('/api/render-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -88,6 +92,7 @@ export default function AutopilotHubPage() {
           imageUrl: item.featured_image_url,
           duration: 10,
         }),
+        signal: AbortSignal.timeout(60_000),
       });
       const data = await res.json();
       if (data.success && data.videoUrl) {
@@ -103,9 +108,14 @@ export default function AutopilotHubPage() {
       } else {
         alert(data.error || 'Error al generar video');
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error('Error generando video para descarga:', e);
-      alert('Hubo un error al procesar el video con FFmpeg');
+      const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+      alert(
+        timedOut
+          ? 'El render tardó demasiado y se canceló. Intenta de nuevo en unos segundos.'
+          : 'Hubo un error al procesar el video.'
+      );
     } finally {
       setRenderingId(null);
     }
@@ -302,6 +312,7 @@ export default function AutopilotHubPage() {
                   category={item.category || 'Noticias'}
                   imageFallback={item.featured_image_url}
                   duration={12}
+                  newsId={item.id}
                 />
 
                 {/* Video Actions */}

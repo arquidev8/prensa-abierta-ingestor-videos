@@ -55,6 +55,7 @@ export async function requestVideoRender(payload: {
   headline: string;
   category: string;
   clip_urls: string[];
+  image_url?: string;
   duration_sec?: number;
 }): Promise<{ job_id: string; job: VideoJob }> {
   const res = await fetch(`${ENGINE_URL}/api/video/render`, {

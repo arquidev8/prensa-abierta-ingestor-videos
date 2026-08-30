@@ -11,6 +11,10 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const category = searchParams.get('category');
     const fileName = searchParams.get('file');
+    // `seed` (típicamente el id de la noticia) hace determinística la selección
+    // dentro de una carpeta con varios clips, para que este preview y la descarga
+    // del mismo item usen el mismo b-roll en vez de uno al azar cada uno.
+    const seed = searchParams.get('seed') || undefined;
 
     let videoPath = '';
 
@@ -23,7 +27,7 @@ export async function GET(req: NextRequest) {
     }
 
     if (!videoPath && category) {
-      const resolved = resolveCategoryVideo(category);
+      const resolved = resolveCategoryVideo(category, undefined, seed);
       if (resolved && fs.existsSync(resolved.filePath)) {
         videoPath = resolved.filePath;
       }

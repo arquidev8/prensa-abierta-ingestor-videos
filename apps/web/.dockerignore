@@ -5,5 +5,3 @@ Dockerfile
 .dockerignore
 .git
 .gitignore
-public/generated_videos
-public/temp_render

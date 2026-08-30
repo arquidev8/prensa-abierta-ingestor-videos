@@ -57,6 +57,7 @@ type VideoRenderRequest struct {
 	Headline      string   `json:"headline"`
 	Category      string   `json:"category"`
 	ClipURLs      []string `json:"clip_urls"`     // 2-3 clip paths or URLs
+	ImageURL      string   `json:"image_url"`     // fallback: imagen destacada de la noticia si no hay clip de video
 	DurationSec   int      `json:"duration_sec"`  // usually 12-15s
 	MusicTrack    string   `json:"music_track"`   // optional preset or custom audio path
 	Resolution    string   `json:"resolution"`    // "1080x1920" (vertical 9:16)
