@@ -64,6 +64,9 @@ Thumbs.db
 # TypeScript build artifacts
 *.tsbuildinfo
 
+# Claude Code skills lockfile (tooling local)
+skills-lock.json
+
 # Other
 .agents
 .doc
