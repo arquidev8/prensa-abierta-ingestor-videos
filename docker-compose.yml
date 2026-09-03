@@ -28,7 +28,7 @@ services:
         NEXT_PUBLIC_ENGINE_URL: http://localhost:8080
     container_name: prensa_abierta_web
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       # Usado únicamente por el bundle del navegador; en runtime del servidor NO tiene efecto
       # (Next.js incrusta NEXT_PUBLIC_* en build-time en todo el bundle, incluido el servidor)
