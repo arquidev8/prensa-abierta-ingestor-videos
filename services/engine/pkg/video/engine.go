@@ -195,19 +195,31 @@ func (e *Engine) RenderVideo(ctx context.Context, jobID string) (*models.VideoJo
 
 func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, outputPath string) error {
 	req := job.Request
-	if len(req.ClipURLs) == 0 {
-		// Buscar si existe video de plantilla en assets/contenido según la categoría
-		if catVideo := e.findCategoryTemplateVideo(req.Category); catVideo != "" {
-			req.ClipURLs = []string{catVideo}
-		} else if req.ImageURL != "" {
-			// Sin clip de video: fallback a la imagen destacada de la noticia (con Ken Burns)
-			return e.renderFallbackImageVideo(ctx, job, outputPath)
-		} else {
-			// Último recurso: video de color de marca con el titular quemado
+	total := req.DurationSec
+	if total <= 0 {
+		total = 12
+	}
+	leadImage := strings.TrimSpace(req.LeadImageURL)
+
+	// Nada que componer → cadena de fallbacks (plantilla → imagen destacada → color).
+	if len(req.ClipURLs) == 0 && leadImage == "" {
+		if !req.NoCategoryFallback {
+			if catVideo := e.findCategoryTemplateVideo(req.Category); catVideo != "" {
+				req.ClipURLs = []string{catVideo}
+			}
+		}
+		if len(req.ClipURLs) == 0 {
+			if req.ImageURL != "" {
+				return e.renderImageZoomVideo(ctx, job, outputPath, req.ImageURL, total)
+			}
 			return e.renderFallbackColorVideo(ctx, job, outputPath)
 		}
 	}
-	clipDuration := float64(req.DurationSec) / float64(len(req.ClipURLs))
+
+	// Solo imagen temática, sin video → animarla durante toda la duración.
+	if len(req.ClipURLs) == 0 && leadImage != "" {
+		return e.renderImageZoomVideo(ctx, job, outputPath, leadImage, total)
+	}
 
 	// Prepare temporary list for concatenation
 	tempDir := filepath.Join(e.outputDir, "temp_"+job.ID)
@@ -216,14 +228,50 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 
 	var preparedClips []string
 
-	for i, clipURL := range req.ClipURLs {
-		if i >= 3 {
-			break // Max 3 clips for 10-15s
+	// Segmento de imagen temática como PRIMER clip (imagen fija con zoom corto).
+	imageSec := 0.0
+	if leadImage != "" {
+		imageSec = req.LeadImageSec
+		if imageSec <= 0 {
+			imageSec = float64(total) * 0.4
 		}
+		if imageSec > 5 {
+			imageSec = 5
+		}
+		if imageSec > float64(total)-3 {
+			imageSec = float64(total) - 3
+		}
+		if imageSec < 2 {
+			imageSec = 0 // muy poco tiempo: se omite la imagen
+		}
+		if imageSec > 0 {
+			if seg, err := e.prepareImageSegment(ctx, tempDir, leadImage, imageSec); err == nil {
+				preparedClips = append(preparedClips, seg)
+			} else {
+				log.Printf("[VideoEngine] Warning: no se pudo preparar la imagen líder %s: %v", leadImage, err)
+				imageSec = 0
+			}
+		}
+	}
+
+	// Clips de video para el tiempo restante.
+	nClips := len(req.ClipURLs)
+	if nClips > 3 {
+		nClips = 3 // Máx. 3 clips para 10-15s
+	}
+	remaining := float64(total) - imageSec
+	if remaining < 1 {
+		remaining = float64(total)
+	}
+	clipDuration := remaining / float64(nClips)
+
+	videoClipsAdded := 0
+	for i := 0; i < nClips; i++ {
+		clipURL := req.ClipURLs[i]
 		trimmedPath := filepath.Join(tempDir, fmt.Sprintf("clip_%d.mp4", i))
 
 		// Scale & Crop to 9:16 (1080x1920) and trim
-		filter := "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"
+		filter := "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p"
 		args := []string{
 			"-y",
 			"-t", fmt.Sprintf("%.2f", clipDuration),
@@ -231,6 +279,7 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 			"-vf", filter,
 			"-c:v", "libx264",
 			"-preset", "ultrafast",
+			"-pix_fmt", "yuv420p",
 			"-an",
 			trimmedPath,
 		}
@@ -242,11 +291,18 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 			continue
 		}
 		preparedClips = append(preparedClips, trimmedPath)
+		videoClipsAdded++
 	}
 
-	if len(preparedClips) == 0 {
+	// Ningún clip de video se pudo preparar (Pexels caído, URLs muertas, etc.): no
+	// dejar un video de solo ~4s (el segmento de imagen); animar la imagen la
+	// duración completa.
+	if videoClipsAdded == 0 {
+		if leadImage != "" {
+			return e.renderImageZoomVideo(ctx, job, outputPath, leadImage, total)
+		}
 		if req.ImageURL != "" {
-			return e.renderFallbackImageVideo(ctx, job, outputPath)
+			return e.renderImageZoomVideo(ctx, job, outputPath, req.ImageURL, total)
 		}
 		return e.renderFallbackColorVideo(ctx, job, outputPath)
 	}
@@ -260,21 +316,21 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	_ = os.WriteFile(concatListFile, []byte(sb.String()), 0644)
 
 	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(req.Headline), headlineMaxCharsPerLine, headlineMaxLines)
-	categoryHeader := buildCategoryHeader(req.Category)
+	lo := layoutFor(req.Template)
 
 	videoFilter := strings.Join([]string{
 		// Dark box at bottom for legibility
-		"drawbox=y=ih-520:color=black@0.85:width=iw:height=520:t=fill",
-		// Category header tag
-		fmt.Sprintf("drawtext=text='%s':fontcolor=0xFFAA00:fontsize=36:x=70:y=h-440", categoryHeader),
+		fmt.Sprintf("drawbox=y=%s:color=black@0.85:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
+		// Punto pulsante + rótulo "ULTIMA HORA • CATEGORÍA"
+		categoryHeaderFilters(req.Category, lo),
 		// Headline text, con salto de línea real (line_spacing) en vez de recortarse
-		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=h-370:line_spacing=18:fix_bounds=true", cleanHeadline),
+		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=%s:line_spacing=%d:fix_bounds=true", cleanHeadline, lo.headY, lo.headLineSpacing),
 	}, ",")
 
 	inputArgs := []string{"-f", "concat", "-safe", "0", "-i", concatListFile}
 	encodeArgs := []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
 
-	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, req.DurationSec)
+	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, total, lo.logoY)
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -284,58 +340,101 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	return nil
 }
 
-// renderFallbackImageVideo genera el reel a partir de la imagen destacada de la
-// noticia cuando no hay ningún clip de video disponible (ni banco propio ni
-// proporcionado por el caller).
+// kenBurnsFilter devuelve la cadena de filtros para hacer zoom-in lento (~10% a lo
+// largo de `dur` segundos) sobre una imagen fija: lienzo 1.5x (1620x2880) →
+// `scale:eval=frame` (re-evalúa el factor cada frame según `t`, tope min(t/dur,1))
+// → `crop` central a 1080x1920. NO se usa `zoompan`, que combinado con `-loop 1`
+// dispara muchísimos más frames de los pedidos (bug observado: +1 min de salida
+// para un pedido de 6s).
+func kenBurnsFilter(dur int) string {
+	if dur < 1 {
+		dur = 1
+	}
+	return fmt.Sprintf(
+		"scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,"+
+			"scale=w='1080*(1+0.10*min(t/%d,1))':h='1920*(1+0.10*min(t/%d,1))':eval=frame,"+
+			"crop=1080:1920,setsar=1",
+		dur, dur,
+	)
+}
+
+// prepareImageSegment renderiza una imagen fija (URL) a un .mp4 corto con zoom, con
+// los MISMOS parámetros que los clips de video (1080x1920, 30fps, yuv420p, h264)
+// para poder concatenarlo como PRIMER segmento de la composición. Devuelve la ruta
+// del archivo generado en tempDir.
+func (e *Engine) prepareImageSegment(ctx context.Context, tempDir, imageURL string, sec float64) (string, error) {
+	localImg, err := e.downloadToTempFile(ctx, imageURL)
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(localImg)
+
+	out := filepath.Join(tempDir, "clip_lead_image.mp4")
+	secInt := int(sec + 0.999)
+	args := []string{
+		"-y",
+		"-loop", "1", "-t", fmt.Sprintf("%.2f", sec),
+		"-i", localImg,
+		"-vf", kenBurnsFilter(secInt) + ",fps=30,format=yuv420p",
+		"-c:v", "libx264", "-preset", "ultrafast",
+		"-pix_fmt", "yuv420p",
+		"-an",
+		out,
+	}
+	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
+	if o, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("ffmpeg segmento de imagen: %v (salida: %s)", err, string(o))
+	}
+	return out, nil
+}
+
+// renderImageZoomVideo genera el reel completo a partir de UNA imagen (URL) con
+// zoom corto durante toda la duración + overlays (caja, rótulo, titular, logo).
+// Se usa cuando no hay ningún clip de video (banco propio, Pexels ni destacada).
 //
-// La imagen se descarga primero a un archivo LOCAL (en vez de pasarle la URL
-// remota directamente a `-loop 1 -i <url>`): en la práctica, loopear una imagen
-// servida por HTTP hace que FFmpeg no termine nunca por su cuenta (el proceso
-// sigue "vivo" tras escribir todos los frames, y el worker termina matándolo al
-// llegar al timeout). Con un archivo local, `-loop 1 -t duration` sí respeta la
-// duración exacta y el proceso termina solo.
-//
-// Nota: NO se usa el filtro `zoompan` (efecto Ken Burns) — probado en la práctica,
-// combinado con `-loop 1` genera muchísimos más frames de los esperados (se
-// observó una salida de +1 minuto de video para un pedido de 6s), por la manera
-// en que zoompan reinterpreta cada repetición del loop como un frame de entrada
-// nuevo. Se prefiere una imagen estática pero con duración correcta y confiable
-// a un efecto más vistoso que puede colgar el render.
-func (e *Engine) renderFallbackImageVideo(ctx context.Context, job *models.VideoJob, outputPath string) error {
+// La imagen se descarga a un archivo LOCAL antes de `-loop 1 -i`: loopear una
+// imagen servida por HTTP hace que FFmpeg no termine solo (sigue "vivo" tras
+// escribir todos los frames y el worker lo mata al llegar al timeout).
+func (e *Engine) renderImageZoomVideo(ctx context.Context, job *models.VideoJob, outputPath, imageURL string, durationSec int) error {
 	req := job.Request
-	duration := req.DurationSec
+	duration := durationSec
 	if duration <= 0 {
 		duration = 12
 	}
 
-	localImagePath, err := e.downloadToTempFile(ctx, req.ImageURL)
+	localImagePath, err := e.downloadToTempFile(ctx, imageURL)
 	if err != nil {
-		log.Printf("[VideoEngine] Warning: no se pudo descargar la imagen %s: %v", req.ImageURL, err)
+		log.Printf("[VideoEngine] Warning: no se pudo descargar la imagen %s: %v", imageURL, err)
 		return e.renderFallbackColorVideo(ctx, job, outputPath)
 	}
 	defer os.Remove(localImagePath)
 
 	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(req.Headline), headlineMaxCharsPerLine, headlineMaxLines)
-	categoryHeader := buildCategoryHeader(req.Category)
+	lo := layoutFor(req.Template)
 
 	videoFilter := strings.Join([]string{
-		"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
-		"drawbox=y=ih-520:color=black@0.85:width=iw:height=520:t=fill",
-		fmt.Sprintf("drawtext=text='%s':fontcolor=0xFFAA00:fontsize=36:x=70:y=h-440", categoryHeader),
-		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=h-370:line_spacing=18:fix_bounds=true", cleanHeadline),
+		kenBurnsFilter(duration),
+		fmt.Sprintf("drawbox=y=%s:color=black@0.85:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
+		categoryHeaderFilters(req.Category, lo),
+		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=%s:line_spacing=%d:fix_bounds=true", cleanHeadline, lo.headY, lo.headLineSpacing),
 	}, ",")
 
 	inputArgs := []string{"-loop", "1", "-t", fmt.Sprintf("%d", duration), "-i", localImagePath}
-	encodeArgs := []string{"-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
+	encodeArgs := []string{"-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
 
-	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration)
+	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration, lo.logoY)
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[VideoEngine] Warning: no se pudo renderizar desde la imagen %s: %v (salida: %s)", req.ImageURL, err, string(output))
+		log.Printf("[VideoEngine] Warning: no se pudo renderizar desde la imagen %s: %v (salida: %s)", imageURL, err, string(output))
 		return e.renderFallbackColorVideo(ctx, job, outputPath)
 	}
 	return nil
+}
+
+// renderFallbackImageVideo: compat — anima la imagen destacada de la noticia.
+func (e *Engine) renderFallbackImageVideo(ctx context.Context, job *models.VideoJob, outputPath string) error {
+	return e.renderImageZoomVideo(ctx, job, outputPath, job.Request.ImageURL, job.Request.DurationSec)
 }
 
 // downloadToTempFile descarga una URL a un archivo temporal en outputDir y
@@ -380,17 +479,18 @@ func (e *Engine) renderFallbackColorVideo(ctx context.Context, job *models.Video
 	if duration <= 0 {
 		duration = 12
 	}
+	lo := layoutFor(req.Template)
 
 	videoFilter := strings.Join([]string{
-		"drawbox=y=ih-480:color=black@0.75:width=iw:height=480:t=fill",
-		"drawtext=text='PRENSA ABIERTA - PUERTO RICO':fontcolor=yellow:fontsize=36:x=60:y=h-410:box=1:boxcolor=red@0.9:boxborderw=10",
-		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=40:x=60:y=h-300:line_spacing=14:fix_bounds=true", cleanHeadline),
+		fmt.Sprintf("drawbox=y=%s:color=black@0.78:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
+		fmt.Sprintf("drawtext=text='PRENSA ABIERTA - PUERTO RICO':fontcolor=yellow:fontsize=36:x=60:y=%s:box=1:boxcolor=red@0.9:boxborderw=10", lo.catTextY),
+		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=40:x=60:y=%s:line_spacing=%d:fix_bounds=true", cleanHeadline, lo.headY, lo.headLineSpacing),
 	}, ",")
 
 	inputArgs := []string{"-f", "lavfi", "-i", fmt.Sprintf("color=c=0x1a1a2e:s=1080x1920:d=%d:r=30", duration)}
 	encodeArgs := []string{"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"}
 
-	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration)
+	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration, lo.logoY)
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -411,13 +511,23 @@ func (e *Engine) renderFallbackColorVideo(ctx context.Context, job *models.Video
 // el logo -loop 1 queda sin límite de duración y el render corre indefinidamente
 // hasta que el timeout del worker lo mata ("signal: killed"), en vez de terminar
 // cuando termina el video base.
-func (e *Engine) buildRenderArgs(inputArgs []string, videoFilter string, outputPath string, encodeArgs []string, durationSec int) []string {
+//
+// El input del logo se acota a durationSec + 2 como margen de seguridad, pero el
+// overlay lleva `shortest=1` para que la salida termine EXACTAMENTE cuando termina
+// el video base (el input más corto) y no cuando termina el logo — sin esto, la
+// salida quedaba ~2s más larga de lo pedido con el b-roll congelado en su último
+// frame durante esa cola.
+func (e *Engine) buildRenderArgs(inputArgs []string, videoFilter string, outputPath string, encodeArgs []string, durationSec int, logoY int) []string {
 	args := append([]string{"-y"}, inputArgs...)
+
+	if logoY <= 0 {
+		logoY = 92
+	}
 
 	if fileExists(e.defaultLogo) {
 		filterComplex := fmt.Sprintf(
-			"[0:v]%s[vout];[1:v]scale=180:180[logo];[vout][logo]overlay=x=W-w-70:y=70[vfinal]",
-			videoFilter,
+			"[0:v]%s[vout];[1:v]scale=240:240[logo];[vout][logo]overlay=x=W-w-60:y=%d:shortest=1[vfinal]",
+			videoFilter, logoY,
 		)
 		safeDuration := durationSec + 2 // margen de seguridad por encima del video base
 		if safeDuration <= 2 {
@@ -441,6 +551,42 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// overlayLayout agrupa las coordenadas de los overlays inferiores (caja oscura,
+// rótulo de categoría, titular) y del logo, para poder cambiarlas según la
+// plantilla elegida (models.VideoRenderRequest.Template) sin duplicar la lógica en
+// los 3 modos de render.
+type overlayLayout struct {
+	boxY, boxH        string // ej. "ih-520", "520"
+	catDotY, catTextY string // ej. "h-441", "h-440"
+	headY             string // ej. "h-370"
+	headLineSpacing   int
+	logoY             int
+}
+
+// layoutFor traduce el nombre de plantilla a coordenadas concretas de overlay.
+// "reels-safe" (ver .agents/formato-video-reel.md): sube el bloque de titular a la
+// safe zone del grid 1:1 (Y:1050–1450 en un lienzo de 1920), deja libres los
+// ~430px inferiores para la UI de Reels, separa el logo ≥180px del borde superior
+// y compacta el interlineado.
+func layoutFor(template string) overlayLayout {
+	if template == "reels-safe" {
+		return overlayLayout{
+			boxY: "ih-880", boxH: "440",
+			catDotY: "h-801", catTextY: "h-800",
+			headY:           "h-740",
+			headLineSpacing: 10,
+			logoY:           190,
+		}
+	}
+	return overlayLayout{
+		boxY: "ih-520", boxH: "520",
+		catDotY: "h-441", catTextY: "h-440",
+		headY:           "h-370",
+		headLineSpacing: 18,
+		logoY:           92,
+	}
+}
+
 // buildCategoryHeader arma el rótulo pequeño mostrado arriba del titular.
 func buildCategoryHeader(category string) string {
 	if category == "" {
@@ -449,10 +595,34 @@ func buildCategoryHeader(category string) string {
 	return fmt.Sprintf("ULTIMA HORA  •  %s", strings.ToUpper(category))
 }
 
+// categoryHeaderColor es el color del rótulo "ULTIMA HORA • …" y del punto que lo precede.
+const categoryHeaderColor = "0xFFAA00"
+
+// categoryHeaderFilters devuelve las cláusulas `drawtext` del rótulo superior
+// precedido de un punto (●) que titila en el mismo color, replicando el indicador
+// pulsante que el preview (VideoPlayerPreview.tsx) dibuja a la izquierda de
+// "ÚLTIMA HORA". El alpha del punto oscila ~0.2→1.0 una vez por segundo (abs(sin)).
+func categoryHeaderFilters(category string, lo overlayLayout) string {
+	dot := fmt.Sprintf(
+		"drawtext=text='●':fontcolor=%s:fontsize=26:x=70:y=%s:alpha='0.2+0.8*abs(sin(PI*t))'",
+		categoryHeaderColor, lo.catDotY,
+	)
+	text := fmt.Sprintf(
+		"drawtext=text='%s':fontcolor=%s:fontsize=36:x=116:y=%s",
+		buildCategoryHeader(category), categoryHeaderColor, lo.catTextY,
+	)
+	return dot + "," + text
+}
+
 const (
-	// Valores tomados de la implementación de Node ya retirada (lib/videoGenerator.ts),
-	// que ya estaban calibrados para el ancho disponible (1080px - márgenes) a fontsize ~46.
-	headlineMaxCharsPerLine = 28
+	// Ancho de línea del titular antes de forzar salto de línea. drawtext de FFmpeg
+	// no hace wrap solo, así que wrapTextForDrawtext corta por conteo de caracteres.
+	// 38 está calibrado midiendo el render real: lienzo de 1080px, margen izquierdo
+	// x=70; con DejaVu Sans Bold a fontsize 46 el ancho medio por carácter ronda los
+	// ~24px, así que ~38 caracteres llegan a ~910px y dejan ~100px de aire a la
+	// derecha sin tocar el borde. El valor previo (28) cortaba demasiado pronto y
+	// dejaba un hueco grande a la derecha.
+	headlineMaxCharsPerLine = 38
 	headlineMaxLines        = 4
 )
 
@@ -514,49 +684,93 @@ func wrapTextForDrawtext(text string, maxCharsPerLine, maxLines int) string {
 	return strings.Join(lines, "\n")
 }
 
+// folderRouting es el espejo (compacto) de FOLDER_ROUTING en
+// apps/web/src/lib/contentLibrary.ts: lleva cualquier categoría de noticia a una
+// de las 8 carpetas canónicas de assets/contenido. El orden importa (gana el
+// primero cuyo keyword esté contenido en la categoría). Sin match → "Ahora".
+//
+// Nota: en la práctica este camino casi no se ejecuta — el frontend
+// (render-video/route.ts) ya resuelve el clip y lo manda en clip_urls; esto solo
+// corre si llega una petición SIN clips. Se mantiene alineado por robustez.
+var folderRouting = []struct {
+	folder   string
+	keywords []string
+}{
+	{"Deportes", []string{"deporte", "baloncesto", "bsn", "futbol", "beisbol", "pelota", "mlb", "nba", "nfl", "voleibol", "tenis", "boxeo", "atletismo", "atleta", "maraton", "olimpic", "campeonato", "torneo", "liga", "seleccion nacional", "medalla", "grandes ligas", "doble a"}},
+	{"Sucesos", []string{"suceso", "tribunal", "justicia", "fiscal", "policia", "crimen", "criminal", "delito", "arrest", "detenid", "asesinat", "homicidio", "tiroteo", "balacera", "balead", "accidente", "choque", "incendio", "bomberos", "robo", "hurto", "asalt", "atraco", "droga", "narcotrafic", "allanamiento", "carcel", "convicto", "sentenciad", "condenad", "juicio", "imputad", "acusad", "querella", "desaparecid", "secuestro", "violacion", "agresion", "emergencia", "rescate", "corte federal"}},
+	{"Economía", []string{"economia", "economic", "finanzas", "financier", "negocio", "comercio", "empresa", "mercado", "bolsa", "wall street", "banco", "banca", "prestamo", "hipoteca", "inflacion", "recesion", "deuda publica", "presupuesto", "hacienda", "ivu", "impuesto", "contribucion", "arancel", "empleo", "desemple", "salario", "nomina", "jubilacion", "pension", "turismo", "hotel", "inversion", "pyme", "criptomoneda", "bitcoin", "gasolina"}},
+	{"Estados Unidos", []string{"estados unidos", "ee. uu", "ee.uu", "eeuu", "washington", "casa blanca", "capitolio federal", "congreso de estados unidos", "congreso federal", "senado federal", "camara federal", "corte suprema federal", "supremo federal", "gobierno federal", "reserva federal", "donald trump", "trump", "joe biden", "kamala harris", "departamento de estado", "homeland security", "servicio de inmigracion", "deportacion", "frontera sur", "nueva york", "la florida", "republicanos", "democratas"}},
+	{"Internacional", []string{"internacional", "del mundo", "a nivel mundial", "extranjero", "naciones unidas", "union europea", "europa", "america latina", "latinoamerica", "republica dominicana", "venezuela", "cuba", "haiti", "mexico", "colombia", "brasil", "argentina", "espana", "china", "rusia", "ucrania", "israel", "palestina", "gaza", "medio oriente", "guerra en", "conflicto en", "cumbre de", "vaticano", "la haya"}},
+	{"Gobierno", []string{"gobierno", "gobernador", "fortaleza", "legislatura", "legislador", "senado", "senador", "camara de representantes", "representante", "proyecto de ley", "resolucion", "reforma", "politic", "partido", "pnp", "ppd", "pip", "mvc", "primarias", "elecciones", "eleccion", "electoral", "plebiscito", "estatus", "estadidad", "independencia", "junta de control", "promesa", "alcalde", "alcaldesa", "alcaldia", "municipio", "municipal", "aee", "prepa", "aaa", "acueductos", "departamento de", "negociado de", "contralor", "corrupcion", "fondos federales", "fema"}},
+	{"Local", []string{"local", "comunidad", "vecinos", "vecindario", "barrio", "barriada", "municipio de", "pueblo de", "casco urbano", "fiestas patronales", "festival", "carnaval", "tradicion", "patrimonio", "cultura", "farandul", "artista", "cantante", "concierto", "musica", "pelicula", "cine", "television", "novela", "celebridad", "influencer", "el tiempo", "clima", "pronostico del tiempo", "lluvia", "tormenta", "huracan", "meteorolog", "salud", "hospital", "medico", "enfermedad", "epidemia", "dengue", "vacuna", "paciente", "educacion", "escuela", "universidad", "upr", "estudiante", "maestro", "matricula", "san juan", "bayamon", "carolina", "ponce", "caguas", "guaynabo", "mayaguez", "arecibo", "aguadilla", "fajardo", "humacao", "trafico", "peaje", "tren urbano", "reciclaje", "playa"}},
+}
+
+const fallbackFolder = "Ahora"
+
+// folderForCategory mapea una categoría de noticia a una de las 8 carpetas canónicas.
+func folderForCategory(category string) string {
+	cat := strings.ToLower(strings.TrimSpace(category))
+	if cat == "" {
+		return fallbackFolder
+	}
+	for _, r := range folderRouting {
+		if strings.EqualFold(cat, r.folder) {
+			return r.folder
+		}
+	}
+	if strings.EqualFold(cat, fallbackFolder) {
+		return fallbackFolder
+	}
+	for _, r := range folderRouting {
+		for _, kw := range r.keywords {
+			if strings.Contains(cat, kw) {
+				return r.folder
+			}
+		}
+	}
+	return fallbackFolder
+}
+
 func (e *Engine) findCategoryTemplateVideo(category string) string {
 	contenidoDir := filepath.Join(e.assetsDir, "contenido")
 	if _, err := os.Stat(contenidoDir); err != nil {
 		return ""
 	}
-
-	catLower := strings.ToLower(category)
 	entries, err := os.ReadDir(contenidoDir)
 	if err != nil {
 		return ""
 	}
 
-	var matchedFolder string
+	// Carpeta objetivo según el ruteo; si no existe en disco, se cae a "Ahora" y
+	// luego a la primera carpeta disponible.
+	pickFrom := func(folderName string) string {
+		for _, entry := range entries {
+			if entry.IsDir() && strings.EqualFold(entry.Name(), folderName) {
+				folderPath := filepath.Join(contenidoDir, entry.Name())
+				files, _ := os.ReadDir(folderPath)
+				for _, f := range files {
+					ext := strings.ToLower(filepath.Ext(f.Name()))
+					if ext == ".mp4" || ext == ".mov" || ext == ".webm" {
+						return filepath.Join(folderPath, f.Name())
+					}
+				}
+			}
+		}
+		return ""
+	}
+
+	if v := pickFrom(folderForCategory(category)); v != "" {
+		return v
+	}
+	if v := pickFrom(fallbackFolder); v != "" {
+		return v
+	}
 	for _, entry := range entries {
 		if entry.IsDir() {
-			nameLower := strings.ToLower(entry.Name())
-			if strings.Contains(catLower, nameLower) || strings.Contains(nameLower, catLower) {
-				matchedFolder = entry.Name()
-				break
+			if v := pickFrom(entry.Name()); v != "" {
+				return v
 			}
 		}
 	}
-
-	if matchedFolder == "" {
-		// Fallback a "Ahora" o primera carpeta
-		for _, entry := range entries {
-			if entry.IsDir() && strings.ToLower(entry.Name()) == "ahora" {
-				matchedFolder = entry.Name()
-				break
-			}
-		}
-	}
-
-	if matchedFolder != "" {
-		folderPath := filepath.Join(contenidoDir, matchedFolder)
-		files, _ := os.ReadDir(folderPath)
-		for _, f := range files {
-			ext := strings.ToLower(filepath.Ext(f.Name()))
-			if ext == ".mp4" || ext == ".mov" || ext == ".webm" {
-				return filepath.Join(folderPath, f.Name())
-			}
-		}
-	}
-
 	return ""
 }

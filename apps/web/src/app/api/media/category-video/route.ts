@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
-import { getAssetsContenidoDir, resolveCategoryVideo } from '@/lib/contentLibrary';
+import { getAssetsContenidoDir, resolveCategoryVideo, resolveComposition } from '@/lib/contentLibrary';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,6 +15,8 @@ export async function GET(req: NextRequest) {
     // dentro de una carpeta con varios clips, para que este preview y la descarga
     // del mismo item usen el mismo b-roll en vez de uno al azar cada uno.
     const seed = searchParams.get('seed') || undefined;
+    // `q` (el titular) afina la elección dentro de "Deportes" por deporte específico.
+    const q = searchParams.get('q') || undefined;
 
     let videoPath = '';
 
@@ -27,9 +29,20 @@ export async function GET(req: NextRequest) {
     }
 
     if (!videoPath && category) {
-      const resolved = resolveCategoryVideo(category, undefined, seed);
-      if (resolved && fs.existsSync(resolved.filePath)) {
-        videoPath = resolved.filePath;
+      const comp = resolveComposition(category, undefined, seed, q);
+      if (comp.video && fs.existsSync(comp.video.filePath)) {
+        videoPath = comp.video.filePath;
+      } else if (comp.leadImage && fs.existsSync(comp.leadImage.filePath)) {
+        // Tema identificado con imagen temática pero sin clip de video local:
+        // se sirve ESA imagen (no un 404) para que el preview muestre la misma
+        // base que usará la descarga real (`lead_image_url` en /api/render-video).
+        // El content-type se ajusta por extensión más abajo (IMG_TYPES).
+        videoPath = comp.leadImage.filePath;
+      } else if (comp.matchedTopic || comp.imagePexelsQuery || comp.videoPexelsQuery) {
+        // Tema identificado, sin imagen ni video local: la composición real se
+        // arma con Pexels / imagen destacada al descargar; el preview cae a su
+        // propio fallback de imagen.
+        return new Response('Sin medio local para este tema; usar imagen', { status: 404 });
       }
     }
 
@@ -49,7 +62,14 @@ export async function GET(req: NextRequest) {
     const range = req.headers.get('range');
 
     const ext = path.extname(videoPath).toLowerCase();
-    const contentType = ext === '.mov' ? 'video/quicktime' : 'video/mp4';
+    const IMG_TYPES: Record<string, string> = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+    };
+    const contentType =
+      IMG_TYPES[ext] || (ext === '.mov' ? 'video/quicktime' : 'video/mp4');
 
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-');

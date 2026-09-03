@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { resolveCategoryVideo } from '@/lib/contentLibrary';
+import { resolveComposition } from '@/lib/contentLibrary';
+import { searchPexelsVideos, searchPexelsPhotos } from '@/lib/pexels';
 import { requestVideoRender, checkVideoJob } from '@/lib/engine';
 
 // Único pipeline de renderizado de video: el Go Engine (services/engine), con su
@@ -28,13 +29,34 @@ function sleep(ms: number) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { newsId, headline, category, tags, imageUrl, duration } = body as {
+    const {
+      newsId,
+      headline,
+      category,
+      tags,
+      imageUrl,
+      duration,
+      background,
+      template,
+      customImageUrl,
+      customClipUrl,
+    } = body as {
       newsId?: string;
       headline?: string;
       category?: string;
       tags?: string[];
       imageUrl?: string;
       duration?: number;
+      // 'image' => composición liderada por la imagen inicial, sin clip de b-roll
+      // (elegido desde el "Editor de video" del modal). 'video' / undefined => flujo normal.
+      background?: 'image' | 'video';
+      // Plantilla de layout: 'reels-safe' aplica la guía .agents/formato-video-reel.md.
+      template?: 'standard' | 'reels-safe';
+      // Archivos importados por el usuario en el "Editor de video" (ya subidos vía
+      // /api/media/upload, rutas same-origin tipo /uploads/<archivo>). Cuando están
+      // presentes, reemplazan la imagen/video que se resolvería automáticamente.
+      customImageUrl?: string;
+      customClipUrl?: string;
     };
 
     if (!headline) {
@@ -42,36 +64,99 @@ export async function POST(req: NextRequest) {
     }
 
     const effectiveNewsId = newsId || `news_${Date.now()}`;
+    const origin = WEB_INTERNAL_URL || req.nextUrl.origin;
+    const abs = (streamUrl: string) => `${origin}${streamUrl}`;
 
-    // Mismo `seed` (id de la noticia) que usa VideoPlayerPreview al pedir el clip
-    // de categoría, para que la descarga use exactamente el mismo b-roll que ya
-    // se le mostró al editor en el preview.
-    const resolved = resolveCategoryVideo(category, tags, effectiveNewsId);
+    // Composición de b-roll siguiendo la ruta:
+    //   1. categoría → carpeta en assets/contenido
+    //   2. imagen referente en esa carpeta → si no hay, foto de Pexels → si no, imagen destacada
+    //   3. video acorde en la MISMA carpeta (tema → genérico) → si no hay, clip de Pexels
+    // `headline` determina el tema; `seed`=id de la noticia hace la elección
+    // determinística para que preview y descarga coincidan.
+    const comp = resolveComposition(category, tags, effectiveNewsId, headline);
 
-    // Si no hay ningún clip propio para esta categoría (assets/contenido vacío o
-    // sin coincidencias), NO cortamos con error: se le pasa `clip_urls` vacío al
-    // Go Engine para que use su propio fallback interno (un video de color con el
-    // titular quemado — ver `renderFallbackColorVideo` en services/engine/pkg/video/engine.go).
-    // Así la descarga SIEMPRE produce un archivo en vez de fallar, igual que el
-    // preview siempre muestra algo (clip real o imagen) en vez de romperse.
-    const clipUrls: string[] = [];
-    if (resolved) {
-      clipUrls.push(`${WEB_INTERNAL_URL || req.nextUrl.origin}${resolved.streamUrl}`);
-    } else {
-      console.warn(
-        `[render-video] Sin clip propio para la categoría "${category}" — el Go Engine usará su fallback de color con el titular quemado.`
-      );
+    // Si el usuario eligió "Imagen" como base en el Editor de video, se omite por
+    // completo el clip de b-roll: la pieza se arma solo con la imagen inicial.
+    const imageOnly = background === 'image';
+
+    // ── Paso 2: IMAGEN líder ────────────────────────────────────────────────
+    // La imagen importada por el usuario (Editor de video) tiene prioridad sobre
+    // la resuelta automáticamente por categoría/tema.
+    let leadImageUrl: string | undefined = customImageUrl
+      ? abs(customImageUrl)
+      : comp.leadImage
+        ? abs(comp.leadImage.streamUrl)
+        : undefined;
+    let leadImageSource = customImageUrl
+      ? 'importada por el usuario'
+      : comp.leadImage
+        ? `banco (${comp.leadImage.fileName})`
+        : '';
+    if (!leadImageUrl && comp.imagePexelsQuery) {
+      try {
+        const pics = await searchPexelsPhotos(comp.imagePexelsQuery);
+        if (pics.length > 0) {
+          leadImageUrl = pics[0];
+          leadImageSource = 'pexels';
+        }
+      } catch (e) {
+        console.warn('[render-video] Búsqueda de foto en Pexels falló:', e);
+      }
     }
+    if (!leadImageUrl && imageUrl) {
+      leadImageUrl = imageUrl;
+      leadImageSource = 'destacada de la noticia';
+    }
+
+    // ── Paso 3: VIDEO de la misma carpeta ──────────────────────────────────
+    // El video importado por el usuario (Editor de video) tiene prioridad sobre
+    // el resuelto automáticamente por categoría/tema.
+    let videoClipUrl: string | undefined = imageOnly
+      ? undefined
+      : customClipUrl
+        ? abs(customClipUrl)
+        : comp.video
+          ? abs(comp.video.streamUrl)
+          : undefined;
+    let videoSource = customClipUrl
+      ? 'importado por el usuario'
+      : videoClipUrl
+        ? `banco (${comp.video!.fileName})`
+        : '';
+    if (!imageOnly && !videoClipUrl && comp.videoPexelsQuery) {
+      try {
+        const pex = await searchPexelsVideos(comp.videoPexelsQuery, category || 'general');
+        if (pex.length > 0) {
+          videoClipUrl = pex[0];
+          videoSource = 'pexels';
+        }
+      } catch (e) {
+        console.warn('[render-video] Búsqueda de video en Pexels falló:', e);
+      }
+    }
+
+    const clipUrls: string[] = videoClipUrl ? [videoClipUrl] : [];
+
+    console.log(
+      `[render-video] carpeta="${comp.matchedFolder}" tema="${comp.matchedTopic || '-'}" ` +
+        `imagen=${leadImageSource || 'ninguna'} video=${videoSource || 'ninguno'}`
+    );
 
     const { job_id } = await requestVideoRender({
       news_id: effectiveNewsId,
       headline,
       category: category || 'NOTICIAS',
       clip_urls: clipUrls,
-      // Fallback para cuando no hay clip propio: el Go Engine usa la imagen
-      // destacada de la noticia (Ken Burns) antes de caer al video de color.
+      lead_image_url: leadImageUrl,
+      // Fallback del Engine cuando no hay ni imagen líder ni clip: usa la imagen
+      // destacada de la noticia (con zoom) antes de caer al video de color.
       image_url: imageUrl,
+      // Si hay un tema identificado —o el usuario forzó "Imagen" como base— el
+      // Engine NO debe sustituir por un clip genérico de la categoría cuando
+      // clip_urls viene vacío.
+      no_category_fallback: !!comp.matchedTopic || imageOnly,
       duration_sec: duration || 12,
+      template: template === 'reels-safe' ? 'reels-safe' : 'standard',
     });
 
     // El Engine renderiza de forma asíncrona (worker pool); hacemos polling acotado

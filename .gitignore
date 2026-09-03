@@ -42,6 +42,9 @@ apps/web/public/generated_videos/*
 !apps/web/public/generated_videos/.gitkeep
 **/temp_render/
 
+# Archivos importados desde el "Editor de video" (imagen/video propios del usuario)
+apps/web/public/uploads/
+
 # Go engine runtime data & compiled binaries
 services/engine/bin/
 services/engine/data/videos/

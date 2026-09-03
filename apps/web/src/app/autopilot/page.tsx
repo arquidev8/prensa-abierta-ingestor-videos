@@ -22,6 +22,18 @@ import VideoPlayerPreview from '@/components/VideoPlayerPreview';
 import StructuredArticleReader from '@/components/StructuredArticleReader';
 import EngineOfflineBanner from '@/components/EngineOfflineBanner';
 import { fetchFromEngine } from '@/lib/engineClient';
+import { inferNewsCategory } from '@/lib/newsCategorizer';
+
+// Categoría para el pipeline de video: se infiere del título/cuerpo (igual que en
+// el Feed) en vez de usar `item.category` tal cual, para que el b-roll matchee el
+// tema real de la noticia — ver el ruteo categoría→carpeta en lib/contentLibrary.ts.
+function videoCategoryFor(item: ProcessedNews): string {
+  return inferNewsCategory(
+    item.title,
+    item.subtitle || (item.content_html || '').replace(/<[^>]+>/g, ' '),
+    item.category
+  );
+}
 
 export default function AutopilotHubPage() {
   const [processedList, setProcessedList] = useState<ProcessedNews[]>([]);
@@ -88,7 +100,7 @@ export default function AutopilotHubPage() {
         body: JSON.stringify({
           newsId: item.id || `news_${Date.now()}`,
           headline: item.title,
-          category: item.category || 'NOTICIAS',
+          category: videoCategoryFor(item),
           imageUrl: item.featured_image_url,
           duration: 10,
         }),
@@ -309,7 +321,7 @@ export default function AutopilotHubPage() {
                 {/* 9:16 Video Player */}
                 <VideoPlayerPreview
                   title={item.title}
-                  category={item.category || 'Noticias'}
+                  category={videoCategoryFor(item)}
                   imageFallback={item.featured_image_url}
                   duration={12}
                   newsId={item.id}

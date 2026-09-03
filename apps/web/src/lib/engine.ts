@@ -56,7 +56,18 @@ export async function requestVideoRender(payload: {
   category: string;
   clip_urls: string[];
   image_url?: string;
+  // Imagen temática que se renderiza como PRIMER segmento (imagen fija con zoom),
+  // seguida de los clips de clip_urls. Si clip_urls viene vacío, la imagen se
+  // anima durante toda la duración.
+  lead_image_url?: string;
+  lead_image_sec?: number;
+  // true = el Engine NO debe sustituir por un clip genérico de la categoría cuando
+  // clip_urls viene vacío; debe ir directo a imagen (con zoom) o color.
+  no_category_fallback?: boolean;
   duration_sec?: number;
+  // Plantilla de composición: 'reels-safe' sube el bloque de titular a la safe zone
+  // del grid 1:1 y separa más el logo. '' / 'standard' = layout por defecto.
+  template?: 'standard' | 'reels-safe';
 }): Promise<{ job_id: string; job: VideoJob }> {
   const res = await fetch(`${ENGINE_URL}/api/video/render`, {
     method: 'POST',

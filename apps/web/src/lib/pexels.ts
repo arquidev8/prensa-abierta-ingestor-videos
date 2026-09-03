@@ -76,6 +76,15 @@ export function sanitizeVideoSearchTags(tags: string[]): string[] {
   return cleaned.length > 0 ? cleaned : ['puerto rico', 'ultimas noticias'];
 }
 
+/**
+ * Busca clips de video verticales en Pexels para `query`. Se usa en el pipeline de
+ * composición cuando falta en el banco propio el video (o la imagen) coherente con
+ * el tema de la noticia: la parte que falte se trae de Pexels para que la
+ * composición imagen+video tenga sentido.
+ *
+ * Con `PEXELS_API_KEY` consulta la API real. Sin key (o si la API falla) cae a un
+ * set de clips "curados" por categoría.
+ */
 export async function searchPexelsVideos(
   query: string,
   category: string = 'general',
@@ -120,7 +129,7 @@ export async function searchPexelsVideos(
   }
 
   // Fallback con clips temáticos
-  const catKey = category.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const catKey = category.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
   if (catKey.includes('poli') || catKey.includes('gobierno') || catKey.includes('senado')) {
     return CURATED_NEWS_CLIPS.politica;
   }
@@ -138,4 +147,38 @@ export async function searchPexelsVideos(
   }
 
   return CURATED_NEWS_CLIPS.general;
+}
+
+/**
+ * Busca FOTOS verticales en Pexels para `query`. Se usa como imagen líder de la
+ * composición cuando la carpeta de la categoría no tiene una imagen referente.
+ * Sin `PEXELS_API_KEY` devuelve `[]` (el caller cae a la imagen destacada de la
+ * noticia). No hay set "curado" de fotos.
+ */
+export async function searchPexelsPhotos(query: string, apiKey?: string): Promise<string[]> {
+  const key = apiKey || process.env.PEXELS_API_KEY;
+  if (!key) return [];
+  const safeQuery = sanitizeVideoSearchQuery(query);
+
+  try {
+    const url = `https://api.pexels.com/v1/search?query=${encodeURIComponent(
+      safeQuery
+    )}&orientation=portrait&size=medium&per_page=3`;
+    const res = await fetch(url, { headers: { Authorization: key } });
+    if (res.ok) {
+      const data = await res.json();
+      const urls: string[] = (data.photos || [])
+        .map((p: any) => p?.src?.large2x || p?.src?.large || p?.src?.original || null)
+        .filter(Boolean);
+      if (urls.length > 0) {
+        console.log(`[Pexels API] ${urls.length} fotos para "${safeQuery}"`);
+        return urls;
+      }
+    } else {
+      console.warn(`[Pexels API] fotos respondió ${res.status} para "${safeQuery}"`);
+    }
+  } catch (e) {
+    console.warn('[Pexels API] Error buscando fotos:', e);
+  }
+  return [];
 }

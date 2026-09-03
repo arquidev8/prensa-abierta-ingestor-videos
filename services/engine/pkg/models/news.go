@@ -58,11 +58,25 @@ type VideoRenderRequest struct {
 	Category      string   `json:"category"`
 	ClipURLs      []string `json:"clip_urls"`     // 2-3 clip paths or URLs
 	ImageURL      string   `json:"image_url"`     // fallback: imagen destacada de la noticia si no hay clip de video
+	// LeadImageURL, si está presente, se renderiza como PRIMER segmento del video
+	// (imagen fija con zoom corto) seguido de los clips de ClipURLs — composición
+	// "imagen temática + video". Si ClipURLs viene vacío, se anima toda la duración.
+	LeadImageURL string  `json:"lead_image_url"`
+	LeadImageSec float64 `json:"lead_image_sec"` // duración del segmento de imagen (default ~40% de DurationSec, tope 5s)
+	// true = si ClipURLs viene vacío, NO buscar un clip de plantilla por categoría;
+	// ir directo a imagen (con zoom) o color. Lo usa el frontend cuando identificó
+	// un tema específico sin video propio en el banco.
+	NoCategoryFallback bool `json:"no_category_fallback"`
 	DurationSec   int      `json:"duration_sec"`  // usually 12-15s
 	MusicTrack    string   `json:"music_track"`   // optional preset or custom audio path
 	Resolution    string   `json:"resolution"`    // "1080x1920" (vertical 9:16)
 	ShowLogo      bool     `json:"show_logo"`     // true to overlay Prensa Abierta logo
 	HeadlineStyle string   `json:"headline_style"` // "lower_third", "banner", "center"
+	// Template de composición: "" / "standard" = layout por defecto; "reels-safe" =
+	// plantilla optimizada para Instagram Reels (bloque de titular elevado a la safe
+	// zone del grid 1:1, logo más separado del borde, interlineado compacto).
+	// Ver .agents/formato-video-reel.md.
+	Template string `json:"template"`
 }
 
 // VideoJob represents an asynchronous video rendering task
