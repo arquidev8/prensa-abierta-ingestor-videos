@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Newspaper,
   Sparkles,
@@ -11,7 +11,6 @@ import {
   ExternalLink,
   RefreshCw,
   Play,
-  Layers,
   ChevronRight,
   ChevronLeft,
   Filter,
@@ -25,14 +24,22 @@ import {
   Flame,
   Search,
   Calendar,
-  Download
+  Download,
+  Tag,
+  Scale,
+  Clapperboard,
+  Upload,
+  Image as ImageIcon,
+  LayoutTemplate
 } from 'lucide-react';
 import { RawNews, ProcessedNews } from '@/lib/types';
 import VideoPlayerPreview from '@/components/VideoPlayerPreview';
-import StructuredArticleReader from '@/components/StructuredArticleReader';
+import ArticleComparison, { LegalAuditBanner, ArticleBody } from '@/components/ArticleComparison';
 import EngineOfflineBanner from '@/components/EngineOfflineBanner';
 import { calculateViralTrendScore } from '@/lib/trends';
 import { fetchFromEngine, ENGINE_URL } from '@/lib/engineClient';
+import { inferNewsCategory } from '@/lib/newsCategorizer';
+import { useVideoRenderCache } from '@/hooks/useVideoRenderCache';
 
 export default function FeedPage() {
   const [rawNews, setRawNews] = useState<RawNews[]>([]);
@@ -57,65 +64,96 @@ export default function FeedPage() {
   const itemsPerPage = 12;
 
   // Modal Article Reader / Editor State
-  const [modalViewTab, setModalViewTab] = useState<'read' | 'edit'>('read');
-  const [articleCompareTab, setArticleCompareTab] = useState<'ai' | 'original' | 'diff'>('ai');
+  const [modalTab, setModalTab] = useState<'resumen' | 'cotejo' | 'video'>('resumen');
+  const [editing, setEditing] = useState<boolean>(false);
   const [editedTitle, setEditedTitle] = useState<string>('');
   const [editedSubtitle, setEditedSubtitle] = useState<string>('');
   const [editedContent, setEditedContent] = useState<string>('');
   const [copied, setCopied] = useState<boolean>(false);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [generationStep, setGenerationStep] = useState<string>('');
-  const [isRenderingVideo, setIsRenderingVideo] = useState<boolean>(false);
 
-  const handleDownloadRealVideo = async (
-    title: string,
-    category: string,
-    imageUrl?: string,
-    id?: string
-  ) => {
-    try {
-      setIsRenderingVideo(true);
-      // Timeout defensivo del lado del cliente: el servidor ya acota su propia espera
-      // (~50s) al pollear el job del Go Engine, pero este límite adicional garantiza
-      // que el botón nunca quede "generando" para siempre ante un fallo de red, un
-      // proxy colgado, etc. — antes no existía ningún timeout en esta llamada.
-      const res = await fetch('/api/render-video', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          newsId: id || `news_${Date.now()}`,
-          headline: title,
-          category: category || 'NOTICIAS',
-          imageUrl: imageUrl,
-          duration: 10,
-        }),
-        signal: AbortSignal.timeout(60_000),
-      });
-      const data = await res.json();
-      if (data.success && data.videoUrl) {
-        const link = document.createElement('a');
-        link.href = data.videoUrl;
-        link.download = `prensa-abierta-${title
-          .toLowerCase()
-          .replace(/[^a-z0-9]/g, '-')
-          .slice(0, 40)}.mp4`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-      } else {
-        alert(data.error || 'Error al generar video');
-      }
-    } catch (e: any) {
-      console.error('Error generando video para descarga:', e);
-      const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
-      alert(
-        timedOut
-          ? 'El render tardó demasiado y se canceló. Intenta de nuevo en unos segundos.'
-          : 'Hubo un error al procesar el video.'
-      );
-    } finally {
-      setIsRenderingVideo(false);
+  // --- Editor de video: base de la composición 9:16 ---
+  // La composición arranca de DOS piezas separadas: una imagen inicial (destacada de
+  // la noticia) y un clip de video de b-roll. En modo edición el usuario elige cuál
+  // de las dos es la base y puede importar un archivo propio para reemplazarla.
+  // Los archivos importados se suben a /api/media/upload (ver `handleImportImage`/
+  // `handleImportClip`): así el Go Engine puede descargarlos por HTTP igual que
+  // cualquier otro clip/imagen, y quedan reflejados tanto en el preview como en la
+  // descarga real (ambos usan el mismo render, ver `useVideoRenderCache`).
+  const [videoEditing, setVideoEditing] = useState<boolean>(false);
+  const [compBase, setCompBase] = useState<'video' | 'image'>('video');
+  const [customImage, setCustomImage] = useState<{ url: string; name: string } | null>(null);
+  const [customClip, setCustomClip] = useState<{ url: string; name: string } | null>(null);
+  const [uploadingMedia, setUploadingMedia] = useState<'image' | 'video' | null>(null);
+  // Plantilla de layout del Reel 9:16 (ver .agents/formato-video-reel.md).
+  const [videoTemplate, setVideoTemplate] = useState<'standard' | 'reels-safe'>('standard');
+
+  const { getState: getRenderState, ensureRendered } = useVideoRenderCache();
+
+  const resetVideoEditor = () => {
+    setVideoEditing(false);
+    setCompBase('video');
+    setVideoTemplate('standard');
+    setCustomImage(null);
+    setCustomClip(null);
+    setUploadingMedia(null);
+  };
+
+  const uploadEditorFile = async (file: File, kind: 'image' | 'video'): Promise<string> => {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('kind', kind);
+    const res = await fetch('/api/media/upload', { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok || !data.url) {
+      throw new Error(data.error || 'No se pudo subir el archivo');
     }
+    return data.url as string;
+  };
+
+  const handleImportImage = async (file?: File | null) => {
+    if (!file) return;
+    setUploadingMedia('image');
+    try {
+      const url = await uploadEditorFile(file, 'image');
+      setCustomImage({ url, name: file.name });
+      setCompBase('image');
+    } catch (e: any) {
+      alert(e?.message || 'No se pudo subir la imagen');
+    } finally {
+      setUploadingMedia(null);
+    }
+  };
+
+  const handleImportClip = async (file?: File | null) => {
+    if (!file) return;
+    setUploadingMedia('video');
+    try {
+      const url = await uploadEditorFile(file, 'video');
+      setCustomClip({ url, name: file.name });
+      setCompBase('video');
+    } catch (e: any) {
+      alert(e?.message || 'No se pudo subir el video');
+    } finally {
+      setUploadingMedia(null);
+    }
+  };
+
+  // La descarga NO vuelve a renderizar nada: usa el mismo .mp4 ya generado para el
+  // preview (misma clave en useVideoRenderCache), garantizando que sean la misma
+  // pieza. Si aún no está listo, el botón queda deshabilitado (ver barra de acciones).
+  const handleDownloadRealVideo = (title: string, url?: string) => {
+    if (!url) return;
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `prensa-abierta-${title
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '-')
+      .slice(0, 40)}.mp4`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
   const fetchNews = async () => {
@@ -164,8 +202,9 @@ export default function FeedPage() {
     setEditedTitle(item.processed?.title || item.raw?.title || '');
     setEditedSubtitle(item.processed?.subtitle || item.raw?.summary || '');
     setEditedContent(item.processed?.content_html || item.raw?.content || '');
-    setModalViewTab('read');
-    setArticleCompareTab('ai');
+    setModalTab('resumen');
+    setEditing(false);
+    resetVideoEditor();
   };
 
   const handleRunPipeline = async (item: RawNews, autoPublishWP: boolean = false) => {
@@ -200,6 +239,91 @@ export default function FeedPage() {
     }
   };
 
+  // Categorías disponibles para el filtro: derivadas del TÍTULO/RESUMEN de cada
+  // noticia (inferNewsCategory), no del campo `category` crudo. Los feeds RSS de
+  // estos medios casi nunca traen categoría por artículo, así que agrupar por
+  // `item.category` tal cual solo da 3-5 valores genéricos (uno por medio, ej.
+  // "General"/"Nacional"), no por tema real — ver lib/newsCategorizer.ts.
+  const availableCategories = useMemo(() => {
+    const set = new Set<string>();
+    rawNews.forEach((item) => {
+      set.add(inferNewsCategory(item.title, item.summary || item.content, item.category));
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'es'));
+  }, [rawNews]);
+
+  // Categoría que se le pasa al pipeline de video (preview + descarga). Se usa la
+  // MISMA categoría inferida del título/resumen que alimenta las chips del Feed
+  // (no la cruda `processed.category`/`raw.category`, que suele ser genérica:
+  // "General"/"Nacional"/"Noticias") para que el b-roll matchee el tema real —
+  // ver el ruteo categoría→carpeta en lib/contentLibrary.ts.
+  const modalVideoCategory = useMemo(() => {
+    if (!selectedItem) return 'Noticias';
+    return inferNewsCategory(
+      selectedItem.processed?.title || selectedItem.raw?.title,
+      selectedItem.raw?.summary || selectedItem.raw?.content || selectedItem.processed?.content_html,
+      selectedItem.processed?.category || selectedItem.raw?.category
+    );
+  }, [selectedItem]);
+
+  // Titular/imagen/id "committed" de la noticia abierta (ignoran el texto que se
+  // esté editando en vivo en el editor rápido, para no disparar un render nuevo en
+  // cada tecla — solo cuando se guarda, `selectedItem` cambia y sí re-renderiza).
+  const modalHeadline = useMemo(() => {
+    if (!selectedItem) return '';
+    return (
+      selectedItem.processed?.title || selectedItem.raw?.title || 'Última Hora Puerto Rico'
+    );
+  }, [selectedItem]);
+  const modalFeaturedImage = useMemo(
+    () => selectedItem?.processed?.featured_image_url || selectedItem?.raw?.image_url,
+    [selectedItem]
+  );
+  const modalVideoId = useMemo(
+    () => selectedItem?.processed?.id || selectedItem?.raw?.id,
+    [selectedItem]
+  );
+
+  // Parámetros que determinan el .mp4 final: cualquier cambio de fondo/plantilla/
+  // archivo importado desde el "Editor de video" produce una clave nueva en el
+  // cache y dispara un render nuevo (ver useVideoRenderCache).
+  const videoRenderParams = useMemo(() => {
+    if (!selectedItem || !modalHeadline) return null;
+    return {
+      newsId: modalVideoId || `news_${Date.now()}`,
+      headline: modalHeadline,
+      category: modalVideoCategory,
+      imageUrl: modalFeaturedImage,
+      background: compBase,
+      template: videoTemplate,
+      customImageUrl: compBase === 'image' ? customImage?.url : undefined,
+      customClipUrl: compBase === 'video' ? customClip?.url : undefined,
+    };
+  }, [
+    selectedItem,
+    modalHeadline,
+    modalVideoId,
+    modalVideoCategory,
+    modalFeaturedImage,
+    compBase,
+    videoTemplate,
+    customImage,
+    customClip,
+  ]);
+
+  const videoRenderState = getRenderState(videoRenderParams);
+
+  // Dispara el render real (Go Engine) apenas hay noticia abierta, y de nuevo
+  // cada vez que cambian los ajustes del "Editor de video" — así el preview
+  // siempre termina mostrando (y la descarga usando) el mismo .mp4.
+  useEffect(() => {
+    if (!videoRenderParams) return;
+    // No disparar mientras se sube un archivo importado: evita renderizar con
+    // datos a medio subir.
+    if (uploadingMedia) return;
+    ensureRendered(videoRenderParams);
+  }, [videoRenderParams, uploadingMedia, ensureRendered]);
+
   // Filter Logic
   const filteredRawNews = rawNews.filter((item) => {
     // Source filter
@@ -209,10 +333,10 @@ export default function FeedPage() {
     if (filterTab === 'pending' && item.status === 'processed') return false;
     if (filterTab === 'processed' && item.status !== 'processed') return false;
 
-    // Category filter
+    // Category filter (misma categoría inferida que arma el filtro de arriba)
     if (selectedCategory !== 'all') {
-      const cat = (item.category || '').toLowerCase();
-      if (!cat.includes(selectedCategory.toLowerCase())) return false;
+      const cat = inferNewsCategory(item.title, item.summary || item.content, item.category);
+      if (cat !== selectedCategory) return false;
     }
 
     // Date filter
@@ -272,7 +396,7 @@ export default function FeedPage() {
         body: JSON.stringify(updated),
       });
       setSelectedItem({ ...selectedItem, processed: updated });
-      setModalViewTab('read');
+      setEditing(false);
       fetchNews();
     } catch (err) {
       console.error('Error guardando cambios:', err);
@@ -439,6 +563,27 @@ export default function FeedPage() {
                 {src.label}
               </button>
             ))}
+          </div>
+
+          {/* Category Filter: dropdown en vez de pills — con 8+ categorías inferidas,
+              una fila de botones forzaba scroll horizontal (se veía mal); un select
+              nativo se combina igual (AND) con el resto de los filtros activos y no
+              tiene ese problema sin importar cuántas categorías haya. */}
+          <div className="flex items-center gap-2 bg-slate-50 px-3.5 py-2 rounded-2xl border border-slate-200 text-xs shrink-0">
+            <Tag className="w-3.5 h-3.5 text-slate-500" />
+            <span className="text-slate-600 font-bold">Categoría:</span>
+            <select
+              value={selectedCategory}
+              onChange={(e) => setSelectedCategory(e.target.value)}
+              className="bg-transparent text-slate-900 font-black focus:outline-none cursor-pointer max-w-[150px]"
+            >
+              <option value="all">Todas</option>
+              {availableCategories.map((cat) => (
+                <option key={cat} value={cat}>
+                  {cat}
+                </option>
+              ))}
+            </select>
           </div>
 
           {/* Pending vs Processed Filter */}
@@ -651,465 +796,602 @@ export default function FeedPage() {
         </div>
       )}
 
-      {/* Enhanced Proportional Modal (Clean Magazine Light Theme) */}
-      {selectedItem && (
-        <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-2 sm:p-4 animate-fadeIn">
-          <div className="bg-white border border-slate-200 rounded-3xl max-w-6xl w-full h-[90vh] overflow-hidden flex flex-col shadow-2xl">
-            {/* Modal Top Bar */}
-            <div className="px-6 py-3.5 border-b border-slate-200 flex items-center justify-between bg-white shrink-0">
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2 px-3 py-1 rounded-xl bg-orange-50 border border-orange-200 text-[#FF5500] text-xs font-black tracking-wider uppercase shadow-sm">
-                  <img src="/logo.png" alt="Logo" className="w-4 h-4 rounded object-cover" />
-                  <span>PRENSA ABIERTA</span>
-                </div>
-                <span className="text-xs text-slate-300 hidden sm:inline">•</span>
-                <span className="text-xs font-bold text-slate-600 hidden sm:inline">
-                  Centro de Redacción & Video 9:16
-                </span>
-              </div>
+      {/* Modal de noticia — pestañas de ancho completo + barra de acciones persistente
+          (portado del rediseño aprobado en /dev/comparativa). El tab "Video 9:16" queda
+          oculto por ahora: el preview vive dentro de "Resumen de noticia" y la descarga
+          en la barra inferior. */}
+      {selectedItem && (() => {
+        const raw = selectedItem.raw;
+        const proc = selectedItem.processed;
+        const hasProcessed = Boolean(proc);
+        const sourceName = raw?.source_name || 'Diario';
+        const displayTitle =
+          editedTitle || proc?.title || raw?.title || 'Última Hora Puerto Rico';
+        const displaySubtitle = editedSubtitle || proc?.subtitle || '';
+        const displayBody = editedContent || proc?.content_html || raw?.content || '';
+        const originalBody = raw?.content || raw?.summary || '';
+        const featuredImage = proc?.featured_image_url || raw?.image_url;
+        const videoId = proc?.id || raw?.id;
+        const isProcessingThis = Boolean(raw && processingId === raw.id);
 
-              <div className="flex items-center gap-2">
-                {/* View Tabs */}
-                <div className="flex items-center bg-slate-100 p-1 rounded-2xl border border-slate-200 text-xs">
-                  <button
-                    onClick={() => setModalViewTab('read')}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-bold transition ${
-                      modalViewTab === 'read'
-                        ? 'bg-[#FF5500] text-white shadow-sm'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    <BookOpen className="w-3.5 h-3.5" />
-                    <span>Lectura</span>
-                  </button>
-                  <button
-                    onClick={() => setModalViewTab('edit')}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-bold transition ${
-                      modalViewTab === 'edit'
-                        ? 'bg-[#FF5500] text-white shadow-sm'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    <Edit3 className="w-3.5 h-3.5" />
-                    <span>Editar</span>
-                  </button>
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-2 sm:p-4 animate-fadeIn">
+            <div className="bg-white border border-slate-200 rounded-3xl max-w-6xl w-full h-[90vh] overflow-hidden flex flex-col shadow-2xl">
+              {/* Barra superior */}
+              <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between gap-3 bg-white shrink-0">
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-orange-50 border border-orange-200 text-[#FF5500] text-[11px] font-black tracking-wider uppercase shadow-sm">
+                    <img src="/logo.png" alt="" className="w-4 h-4 rounded object-cover" />
+                    <span>Prensa Abierta</span>
+                  </span>
+                  <span className="hidden sm:block truncate text-xs font-bold text-slate-500">
+                    {proc?.category || raw?.category || 'Noticias'} · Fuente: {sourceName}
+                  </span>
                 </div>
-
                 <button
                   onClick={() => setSelectedItem(null)}
-                  className="p-2 text-slate-400 hover:text-slate-900 rounded-xl hover:bg-slate-100 transition font-bold text-xs ml-1"
+                  className="p-2 text-slate-400 hover:text-slate-900 rounded-xl hover:bg-slate-100 transition font-bold text-xs shrink-0"
                 >
                   ✕ Cerrar
                 </button>
               </div>
-            </div>
 
-            {/* Modal Body (2 Columns) */}
-            <div className="p-6 overflow-hidden flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-0 relative bg-slate-50/50">
-              {/* Live AI Processing Overlay if Generating */}
-              {isGenerating && (
-                <div className="absolute inset-0 z-30 bg-white/95 backdrop-blur-md flex flex-col items-center justify-center p-6 space-y-4 text-center animate-fadeIn">
-                  <div className="relative">
+              {/* Pestañas principales (ancho completo) */}
+              <div className="flex items-center justify-between gap-2 border-b border-slate-200 bg-slate-50/70 px-3 sm:px-5 shrink-0">
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => setModalTab('resumen')}
+                    className={`-mb-px flex items-center gap-1.5 border-b-2 px-3 py-3 text-xs font-bold transition ${
+                      modalTab === 'resumen'
+                        ? 'border-[#FF5500] text-[#FF5500]'
+                        : 'border-transparent text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <BookOpen className="w-3.5 h-3.5" />
+                    <span>Resumen de noticia</span>
+                  </button>
+                  <button
+                    onClick={() => setModalTab('cotejo')}
+                    className={`-mb-px flex items-center gap-1.5 border-b-2 px-3 py-3 text-xs font-bold transition ${
+                      modalTab === 'cotejo'
+                        ? 'border-[#FF5500] text-[#FF5500]'
+                        : 'border-transparent text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <Scale className="w-3.5 h-3.5" />
+                    <span>Comparativa & Diferencias</span>
+                  </button>
+                  <button
+                    onClick={() => setModalTab('video')}
+                    className={`-mb-px flex items-center gap-1.5 border-b-2 px-3 py-3 text-xs font-bold transition ${
+                      modalTab === 'video'
+                        ? 'border-[#FF5500] text-[#FF5500]'
+                        : 'border-transparent text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <Clapperboard className="w-3.5 h-3.5" />
+                    <span>Editor de video</span>
+                  </button>
+                </div>
+
+                {modalTab === 'resumen' && (
+                  <button
+                    onClick={() => setEditing((e) => !e)}
+                    className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-bold transition ${
+                      editing
+                        ? 'border-[#FF5500] bg-orange-50 text-[#FF5500]'
+                        : 'border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Edit3 className="w-3.5 h-3.5" />
+                    {editing ? 'Volver a lectura' : 'Editar'}
+                  </button>
+                )}
+              </div>
+
+              {/* Cuerpo (scroll único del modal) */}
+              <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50/50 custom-scrollbar relative">
+                {/* Overlay mientras la IA redacta */}
+                {isGenerating && (
+                  <div className="absolute inset-0 z-30 bg-white/95 backdrop-blur-md flex flex-col items-center justify-center p-6 space-y-4 text-center animate-fadeIn">
                     <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-[#FF5500] to-amber-400 flex items-center justify-center shadow-xl shadow-orange-500/30 animate-pulse">
                       <Sparkles className="w-8 h-8 text-white animate-spin" />
                     </div>
+                    <div className="space-y-1 max-w-sm">
+                      <h3 className="text-lg font-black text-slate-900">
+                        Redactando noticia &amp; generando video
+                      </h3>
+                      <p className="text-xs text-slate-600 font-medium">
+                        {generationStep ||
+                          `El modelo de IA (${selectedModel}) está redactando el artículo para WordPress y preparando el Reel 9:16...`}
+                      </p>
+                    </div>
+                    <div className="w-48 h-2 bg-slate-200 rounded-full overflow-hidden">
+                      <div className="h-full bg-gradient-to-r from-[#FF5500] to-amber-400 w-full animate-pulse" />
+                    </div>
                   </div>
-                  <div className="space-y-1 max-w-sm">
-                    <h3 className="text-lg font-black text-slate-900">
-                      Redactando Noticia & Generando Video
-                    </h3>
-                    <p className="text-xs text-slate-600 font-medium">
-                      {generationStep || `El modelo de IA (${selectedModel}) está redactando el artículo para WordPress y preparando el Reel 9:16...`}
-                    </p>
-                  </div>
-                  <div className="w-48 h-2 bg-slate-200 rounded-full overflow-hidden">
-                    <div className="h-full bg-gradient-to-r from-[#FF5500] to-amber-400 w-full animate-pulse" />
-                  </div>
-                </div>
-              )}
+                )}
 
-              {/* Left Column: Article Reader / Editor (Smooth Independent Scroll) */}
-              <div className="lg:col-span-7 overflow-y-auto h-full pr-3 space-y-5">
-                {modalViewTab === 'read' ? (
-                  /* --- Magazine Reading Mode --- */
-                  <div className="space-y-4">
-                    {/* Header & Meta */}
-                    <div className="space-y-2 bg-white p-5 rounded-3xl border border-slate-200/90 shadow-sm">
-                      <div className="flex items-center gap-2">
-                        <span className="px-2.5 py-0.5 rounded-full text-[11px] font-black bg-orange-100 text-[#FF5500] border border-orange-200 uppercase tracking-wide">
-                          {selectedItem.processed?.category || selectedItem.raw?.category || 'Noticias'}
+                {/* --- Tab: Resumen de noticia --- */}
+                {modalTab === 'resumen' && (
+                  <div className="mx-auto max-w-3xl space-y-5 px-4 py-6 sm:px-6">
+                    {/* 1 · Título */}
+                    <div className="space-y-2.5 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="rounded-full border border-orange-200 bg-orange-100 px-2.5 py-0.5 text-[11px] font-black uppercase tracking-wide text-[#FF5500]">
+                          {proc?.category || raw?.category || 'Noticias'}
                         </span>
-                        <span className="text-xs text-slate-300">•</span>
-                        <span className="text-xs text-slate-500 font-semibold">
-                          Fuente: {selectedItem.raw?.source_name}
-                        </span>
+                        {raw?.original_url && (
+                          <a
+                            href={raw.original_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-slate-800"
+                          >
+                            <ExternalLink className="w-3 h-3" /> {sourceName}
+                          </a>
+                        )}
                       </div>
-
-                      <h1 className="text-xl sm:text-2xl font-black text-slate-900 leading-tight tracking-tight">
-                        {editedTitle || selectedItem.processed?.title || selectedItem.raw?.title}
+                      <h1 className="text-xl sm:text-2xl font-black leading-tight tracking-tight text-slate-900">
+                        {displayTitle}
                       </h1>
-
-                      {(editedSubtitle || selectedItem.processed?.subtitle) && (
-                        <div className="border-l-3 border-[#FF5500] pl-3.5 py-1 bg-orange-50/50 rounded-r-xl">
-                          <p className="text-xs sm:text-sm font-semibold text-slate-700 leading-relaxed italic">
-                            {editedSubtitle || selectedItem.processed?.subtitle}
+                      {displaySubtitle && (
+                        <div className="rounded-r-xl border-l-4 border-[#FF5500] bg-orange-50/50 py-1 pl-3.5">
+                          <p className="text-xs sm:text-sm font-semibold italic leading-relaxed text-slate-700">
+                            {displaySubtitle}
                           </p>
                         </div>
                       )}
                     </div>
 
-                    {/* Subtabs Selector: AI vs Original vs Comparativa */}
-                    <div className="flex items-center gap-1.5 p-1.5 bg-white rounded-2xl border border-slate-200 text-xs w-fit shadow-sm">
-                      <button
-                        onClick={() => setArticleCompareTab('ai')}
-                        className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl font-bold transition ${
-                          articleCompareTab === 'ai'
-                            ? 'bg-[#FF5500] text-white shadow-sm'
-                            : 'text-slate-600 hover:text-slate-900'
-                        }`}
-                      >
-                        <Sparkles className="w-3.5 h-3.5" />
-                        <span>✨ Prensa Abierta (IA)</span>
-                      </button>
-                      <button
-                        onClick={() => setArticleCompareTab('original')}
-                        className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl font-bold transition ${
-                          articleCompareTab === 'original'
-                            ? 'bg-slate-800 text-white shadow-sm'
-                            : 'text-slate-600 hover:text-slate-900'
-                        }`}
-                      >
-                        <Newspaper className="w-3.5 h-3.5" />
-                        <span>📰 Diario Original ({selectedItem.raw?.source_name || 'Fuente'})</span>
-                      </button>
-                      <button
-                        onClick={() => setArticleCompareTab('diff')}
-                        className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl font-bold transition ${
-                          articleCompareTab === 'diff'
-                            ? 'bg-amber-600 text-white shadow-sm'
-                            : 'text-slate-600 hover:text-slate-900'
-                        }`}
-                      >
-                        <Layers className="w-3.5 h-3.5" />
-                        <span>⚖️ Comparativa & Diferencias</span>
-                      </button>
-                    </div>
-
-                    {/* View 1: Redacción Prensa Abierta (IA) */}
-                    {articleCompareTab === 'ai' && (
-                      <div className="p-5 rounded-3xl bg-white border border-slate-200 space-y-4 shadow-sm">
-                        <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-black text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
-                              <BookOpen className="w-4 h-4 text-[#FF5500]" />
-                              {selectedItem.processed
-                                ? 'Redacción Prensa Abierta (Lista para WordPress)'
-                                : 'Texto Crudo (Pendiente de Procesar con IA)'}
-                            </span>
-                            {selectedItem.processed ? (
-                              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-800 border border-emerald-200">
-                                ✓ 100% Original IA
-                              </span>
-                            ) : (
-                              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-amber-100 text-amber-800 border border-amber-200">
-                                ⚠️ Pulsa Redactar con IA
-                              </span>
-                            )}
-                          </div>
-
-                          <button
-                            onClick={handleCopyContent}
-                            className="flex items-center gap-1.5 text-xs font-bold text-slate-600 hover:text-slate-900 transition px-3 py-1.5 rounded-xl bg-slate-100 border border-slate-200"
-                          >
-                            {copied ? (
-                              <>
-                                <Check className="w-3.5 h-3.5 text-emerald-600" />
-                                <span className="text-emerald-700">Copiado</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3.5 h-3.5" />
-                                <span>Copiar Texto</span>
-                              </>
-                            )}
-                          </button>
+                    {!editing && (
+                      <>
+                        {/* 2 · Preview del video */}
+                        <div className="flex flex-col items-center gap-3 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+                          <span className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-slate-700">
+                            <Video className="w-3.5 h-3.5 text-[#FF5500]" /> Video Reel 9:16
+                          </span>
+                          <VideoPlayerPreview
+                            title={displayTitle}
+                            category={modalVideoCategory}
+                            template={videoTemplate}
+                            duration={12}
+                            newsId={videoId}
+                            renderState={videoRenderState}
+                            onRetryRender={() => ensureRendered(videoRenderParams)}
+                          />
+                          {(compBase === 'image' ||
+                            customImage ||
+                            customClip ||
+                            videoTemplate !== 'standard') && (
+                            <p className="text-[11px] text-slate-400">
+                              Ajustado en la pestaña “Editor de video”.
+                            </p>
+                          )}
                         </div>
 
-                        {/* Formatted Article Body */}
-                        <StructuredArticleReader
-                          content={
-                            editedContent ||
-                            selectedItem.processed?.content_html ||
-                            selectedItem.raw?.content ||
-                            ''
-                          }
-                          isAIRewritten={Boolean(selectedItem.processed)}
-                        />
+                        {/* 3 · Auditoría legal anti-plagio */}
+                        {hasProcessed && (
+                          <LegalAuditBanner
+                            originalContent={originalBody}
+                            rewrittenContent={displayBody}
+                          />
+                        )}
+                      </>
+                    )}
 
-                        {/* AI Trigger Button */}
-                        {selectedItem.raw && (
-                          <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
-                            <span className="text-xs text-slate-500">
-                              {selectedItem.processed
-                                ? '¿Quieres reescribir con otro enfoque editorial?'
-                                : 'Genera la versión periodística propia para WordPress.'}
-                            </span>
+                    {/* 4 · Nota completa / editor */}
+                    {editing ? (
+                      <div className="space-y-4 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+                        <span className="flex items-center gap-1.5 text-sm font-bold text-slate-900">
+                          <Edit3 className="w-4 h-4 text-[#FF5500]" /> Editor rápido de noticia
+                        </span>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-slate-700">
+                            Titular de Prensa Abierta
+                          </label>
+                          <input
+                            type="text"
+                            value={editedTitle}
+                            onChange={(e) => setEditedTitle(e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-xs text-slate-900 font-bold focus:outline-none focus:border-[#FF5500]"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-slate-700">Bajada / Subtítulo</label>
+                          <input
+                            type="text"
+                            value={editedSubtitle}
+                            onChange={(e) => setEditedSubtitle(e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 text-xs text-slate-800 focus:outline-none focus:border-[#FF5500]"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-slate-700">Cuerpo del artículo</label>
+                          <textarea
+                            rows={12}
+                            value={editedContent}
+                            onChange={(e) => setEditedContent(e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-xs text-slate-800 font-mono leading-relaxed focus:outline-none focus:border-[#FF5500]"
+                          />
+                        </div>
+                        <div className="flex justify-end">
+                          <button
+                            onClick={handleSaveChanges}
+                            disabled={!hasProcessed}
+                            className={`flex items-center gap-2 px-6 py-2.5 rounded-xl text-white text-xs font-bold shadow-md transition active:scale-95 ${
+                              hasProcessed
+                                ? 'bg-[#FF5500] hover:bg-[#E04B00] shadow-orange-500/20'
+                                : 'bg-slate-300 cursor-not-allowed'
+                            }`}
+                          >
+                            <Save className="w-4 h-4" />
+                            <span>Guardar cambios</span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                          <span className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-slate-700">
+                            <BookOpen className="w-3.5 h-3.5 text-[#FF5500]" />
+                            {hasProcessed
+                              ? 'Nota completa (redacción IA)'
+                              : 'Texto original (sin redactar)'}
+                          </span>
+                          {raw && (
                             <button
-                              disabled={processingId === selectedItem.raw.id}
-                              onClick={async () => {
-                                if (selectedItem.raw) {
-                                  await handleRunPipeline(selectedItem.raw, false);
-                                }
-                              }}
-                              className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-gradient-to-r from-[#FF5500] to-[#FF7700] hover:from-[#E04B00] hover:to-[#FF6600] text-white text-xs font-bold shadow-md shadow-orange-500/20 transition shrink-0 active:scale-95"
+                              disabled={isProcessingThis}
+                              onClick={() => handleRunPipeline(raw, false)}
+                              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-bold transition ${
+                                isProcessingThis
+                                  ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                                  : 'bg-gradient-to-r from-[#FF5500] to-[#FF7700] hover:from-[#E04B00] hover:to-[#FF6600] text-white shadow-sm shadow-orange-500/20'
+                              }`}
                             >
                               <Sparkles className="w-3.5 h-3.5" />
-                              <span>
-                                {processingId === selectedItem.raw.id
-                                  ? 'Redactando con IA...'
-                                  : 'Redactar Noticia Completa (Web)'}
-                              </span>
+                              {isProcessingThis
+                                ? 'Redactando...'
+                                : hasProcessed
+                                  ? 'Redactar de nuevo'
+                                  : 'Redactar con IA'}
                             </button>
+                          )}
+                        </div>
+
+                        <ArticleBody content={hasProcessed ? displayBody : originalBody} />
+
+                        {proc?.tags && proc.tags.length > 0 && (
+                          <div className="mt-4 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-4">
+                            <span className="mr-1 text-xs font-bold text-slate-500">Etiquetas:</span>
+                            {proc.tags.map((t, idx) => (
+                              <span
+                                key={idx}
+                                className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-medium text-slate-700"
+                              >
+                                #{t}
+                              </span>
+                            ))}
                           </div>
                         )}
                       </div>
                     )}
+                  </div>
+                )}
 
-                    {/* View 2: Noticia Original del Diario */}
-                    {articleCompareTab === 'original' && (
-                      <div className="p-5 rounded-3xl bg-white border border-slate-200 space-y-4 shadow-sm">
-                        <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                          <span className="text-xs font-black text-amber-700 uppercase tracking-wider flex items-center gap-1.5">
-                            <Newspaper className="w-4 h-4 text-amber-600" />
-                            Materia Prima Original: {selectedItem.raw?.source_name}
-                          </span>
-                          <a
-                            href={selectedItem.raw?.original_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="flex items-center gap-1.5 text-xs font-bold text-slate-600 hover:text-slate-900 transition px-3 py-1.5 rounded-xl bg-slate-100 border border-slate-200"
+                {/* --- Tab: Comparativa & Diferencias --- */}
+                {modalTab === 'cotejo' && (
+                  <div className="px-4 py-5 sm:px-6">
+                    {hasProcessed && raw ? (
+                      <ArticleComparison
+                        sourceName={sourceName}
+                        originalTitle={raw.title}
+                        originalContent={originalBody}
+                        rewrittenTitle={displayTitle}
+                        rewrittenContent={displayBody}
+                      />
+                    ) : (
+                      <div className="mx-auto max-w-md rounded-3xl border border-dashed border-slate-300 bg-white p-8 text-center shadow-sm">
+                        <Scale className="mx-auto mb-3 h-8 w-8 text-slate-300" />
+                        <p className="text-sm font-bold text-slate-800">
+                          Todavía no hay redacción propia para comparar
+                        </p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          Redacta la noticia con IA y aquí verás el cotejo párrafo a párrafo contra el
+                          texto del diario original.
+                        </p>
+                        {raw && (
+                          <button
+                            disabled={isProcessingThis}
+                            onClick={() => handleRunPipeline(raw, false)}
+                            className={`mt-4 inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-white shadow-md transition ${
+                              isProcessingThis
+                                ? 'bg-slate-300 cursor-not-allowed'
+                                : 'bg-gradient-to-r from-[#FF5500] to-[#FF7700] hover:from-[#E04B00] hover:to-[#FF6600] shadow-orange-500/20'
+                            }`}
                           >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                            <span>Ver en {selectedItem.raw?.source_name}</span>
-                          </a>
-                        </div>
-
-                        <div className="space-y-1 pb-2 border-b border-slate-100">
-                          <span className="text-[10px] text-slate-400 font-bold uppercase">Titular Original:</span>
-                          <h3 className="text-sm font-bold text-slate-800">{selectedItem.raw?.title}</h3>
-                        </div>
-
-                        <StructuredArticleReader
-                          content={selectedItem.raw?.content || selectedItem.raw?.summary || ''}
-                          isAIRewritten={false}
-                        />
-                      </div>
-                    )}
-
-                    {/* View 3: Comparativa & Diferencias */}
-                    {articleCompareTab === 'diff' && (
-                      <div className="space-y-4">
-                        {/* Legal & Editorial Audit Banner */}
-                        <div className="p-5 rounded-3xl bg-gradient-to-r from-emerald-50 via-teal-50 to-white border border-emerald-200 space-y-3 shadow-sm">
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-black uppercase tracking-wider text-emerald-800 flex items-center gap-1.5">
-                              <CheckCircle2 className="w-4 h-4 text-emerald-600" /> Auditoría Legal Anti-Plagio
-                            </span>
-                            <span className="px-3 py-1 rounded-full text-[10.5px] font-black bg-emerald-100 text-emerald-800 border border-emerald-300">
-                              ✓ 100% Reescritura Libre de Derechos
-                            </span>
-                          </div>
-
-                          <div className="grid grid-cols-3 gap-2.5 text-center pt-1 text-xs">
-                            <div className="p-2.5 rounded-2xl bg-white border border-slate-200 shadow-sm">
-                              <span className="text-slate-400 text-[10px] block font-semibold">Voz Editorial</span>
-                              <strong className="text-slate-900 font-bold">Prensa Abierta</strong>
-                            </div>
-                            <div className="p-2.5 rounded-2xl bg-white border border-slate-200 shadow-sm">
-                              <span className="text-slate-400 text-[10px] block font-semibold">Menciones Externas</span>
-                              <strong className="text-emerald-700 font-bold">0 (Eliminadas)</strong>
-                            </div>
-                            <div className="p-2.5 rounded-2xl bg-white border border-slate-200 shadow-sm">
-                              <span className="text-slate-400 text-[10px] block font-semibold">Hechos</span>
-                              <strong className="text-orange-600 font-bold">Sintetizados</strong>
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Side-by-Side Columns */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          {/* Original Column */}
-                          <div className="p-4 rounded-3xl bg-white border border-amber-200 space-y-3 shadow-sm flex flex-col justify-between">
-                            <span className="text-xs font-bold text-amber-800 border-b border-slate-100 pb-2 flex items-center justify-between">
-                              <span>📰 Materia Prima: {selectedItem.raw?.source_name}</span>
-                              <span className="text-[10px] text-slate-400 font-mono">Texto Original</span>
-                            </span>
-                            <div className="max-h-96 overflow-y-auto pr-1 space-y-2 custom-scrollbar">
-                              <h4 className="text-xs font-bold text-slate-800 pb-1 border-b border-slate-100">
-                                {selectedItem.raw?.title}
-                              </h4>
-                              <StructuredArticleReader
-                                content={selectedItem.raw?.content || selectedItem.raw?.summary || ''}
-                                isAIRewritten={false}
-                              />
-                            </div>
-                          </div>
-
-                          {/* Prensa Abierta IA Column */}
-                          <div className="p-4 rounded-3xl bg-white border border-orange-200 space-y-3 shadow-sm flex flex-col justify-between">
-                            <span className="text-xs font-bold text-[#FF5500] border-b border-slate-100 pb-2 flex items-center justify-between">
-                              <span>✨ Redacción Propia: Prensa Abierta</span>
-                              <span className="text-[10px] text-emerald-700 font-mono font-bold">✓ 100% Reescrita</span>
-                            </span>
-                            <div className="max-h-96 overflow-y-auto pr-1 space-y-2 custom-scrollbar">
-                              <h4 className="text-xs font-bold text-slate-900 pb-1 border-b border-slate-100">
-                                {selectedItem.processed?.title || editedTitle || selectedItem.raw?.title}
-                              </h4>
-                              <StructuredArticleReader
-                                content={
-                                  editedContent ||
-                                  selectedItem.processed?.content_html ||
-                                  ''
-                                }
-                                isAIRewritten={true}
-                              />
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Tags */}
-                    {selectedItem.processed?.tags && (
-                      <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                        <span className="text-xs text-slate-500 font-bold mr-1">Etiquetas:</span>
-                        {selectedItem.processed.tags.map((t, idx) => (
-                          <span
-                            key={idx}
-                            className="px-3 py-1 rounded-xl bg-white border border-slate-200 text-xs font-semibold text-slate-700 shadow-sm"
-                          >
-                            #{t}
-                          </span>
-                        ))}
+                            <Sparkles className="h-3.5 w-3.5" />
+                            {isProcessingThis ? 'Redactando...' : 'Redactar con IA'}
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
-                ) : (
-                  /* --- Fast Inline Editor Mode --- */
-                  <div className="space-y-4 p-5 rounded-3xl bg-white border border-slate-200 shadow-sm">
-                    <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                      <span className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
-                        <Edit3 className="w-4 h-4 text-[#FF5500]" /> Editor Rápido de Noticia
+                )}
+
+                {/* --- Tab: Editor de video --- */}
+                {modalTab === 'video' && (
+                  <div className="mx-auto max-w-3xl space-y-5 px-4 py-6 sm:px-6">
+                    {/* Vista previa + acceso a edición del fondo */}
+                    <div className="flex flex-col items-center gap-3 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+                      <div className="flex w-full items-center justify-between">
+                        <span className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-slate-700">
+                          <Clapperboard className="w-3.5 h-3.5 text-[#FF5500]" /> Vista previa · Reel 9:16
+                        </span>
+                        <button
+                          onClick={() => setVideoEditing((v) => !v)}
+                          className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-bold transition ${
+                            videoEditing
+                              ? 'border-[#FF5500] bg-orange-50 text-[#FF5500]'
+                              : 'border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          <Edit3 className="w-3.5 h-3.5" />
+                          {videoEditing ? 'Listo' : 'Editar fondo'}
+                        </button>
+                      </div>
+
+                      <VideoPlayerPreview
+                        title={displayTitle}
+                        category={modalVideoCategory}
+                        template={videoTemplate}
+                        duration={12}
+                        newsId={videoId}
+                        renderState={videoRenderState}
+                        onRetryRender={() => ensureRendered(videoRenderParams)}
+                      />
+
+                      {!videoEditing && (
+                        <p className="text-[11px] text-slate-400">
+                          Fondo actual:{' '}
+                          {compBase === 'image'
+                            ? customImage
+                              ? `imagen importada (${customImage.name})`
+                              : 'imagen inicial de la noticia'
+                            : customClip
+                              ? `video importado (${customClip.name})`
+                              : `clip automático · ${modalVideoCategory}`}
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Plantilla del Reel (layout de titular / logo) */}
+                    <div className="space-y-3 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+                      <span className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-slate-700">
+                        <LayoutTemplate className="w-3.5 h-3.5 text-[#FF5500]" /> Plantilla del Reel
                       </span>
-                      <span className="text-xs text-slate-500">Modifica el texto antes de inyectar en WordPress</span>
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <button
+                          type="button"
+                          onClick={() => setVideoTemplate('standard')}
+                          className={`rounded-2xl border p-3 text-left transition ${
+                            videoTemplate === 'standard'
+                              ? 'border-[#FF5500] bg-orange-50/50 ring-1 ring-[#FF5500]/30'
+                              : 'border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <span className="block text-xs font-black text-slate-800">Estándar</span>
+                          <span className="mt-1 block text-[10.5px] text-slate-500">
+                            Titular pegado al borde inferior, ocupa todo el alto 9:16.
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setVideoTemplate('reels-safe')}
+                          className={`rounded-2xl border p-3 text-left transition ${
+                            videoTemplate === 'reels-safe'
+                              ? 'border-[#FF5500] bg-orange-50/50 ring-1 ring-[#FF5500]/30'
+                              : 'border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <span className="block text-xs font-black text-slate-800">
+                            Instagram Reels (Safe Zone)
+                          </span>
+                          <span className="mt-1 block text-[10.5px] text-slate-500">
+                            Titular elevado a la zona 1:1, logo más separado del borde y los
+                            últimos ~15% libres para la UI de Reels.
+                          </span>
+                        </button>
+                      </div>
+                      <p className="text-[10.5px] text-slate-400">
+                        Se aplica a la vista previa y a la descarga (.mp4).
+                      </p>
                     </div>
 
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-bold text-slate-700">Titular de Prensa Abierta</label>
-                      <input
-                        type="text"
-                        value={editedTitle}
-                        onChange={(e) => setEditedTitle(e.target.value)}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-xs text-slate-900 font-bold focus:outline-none focus:border-[#FF5500]"
-                      />
-                    </div>
+                    {/* Editor del fondo: imagen inicial vs video de composición */}
+                    {videoEditing && (
+                      <div className="space-y-4 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+                        <div>
+                          <span className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-slate-700">
+                            <Clapperboard className="w-3.5 h-3.5 text-[#FF5500]" /> Base de la composición
+                          </span>
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            Elige con qué arranca el Reel 9:16 e importa un archivo propio si quieres
+                            reemplazar el generado automáticamente.
+                          </p>
+                        </div>
 
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-bold text-slate-700">Bajada / Subtítulo</label>
-                      <input
-                        type="text"
-                        value={editedSubtitle}
-                        onChange={(e) => setEditedSubtitle(e.target.value)}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 text-xs text-slate-800 focus:outline-none focus:border-[#FF5500]"
-                      />
-                    </div>
+                        {/* Selector: Imagen inicial | Video de composición (separados) */}
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                          <button
+                            type="button"
+                            onClick={() => setCompBase('image')}
+                            className={`rounded-2xl border p-3 text-left transition ${
+                              compBase === 'image'
+                                ? 'border-[#FF5500] bg-orange-50/50 ring-1 ring-[#FF5500]/30'
+                                : 'border-slate-200 hover:border-slate-300'
+                            }`}
+                          >
+                            <span className="flex items-center gap-1.5 text-xs font-black text-slate-800">
+                              <ImageIcon className="w-3.5 h-3.5 text-[#FF5500]" /> Imagen inicial
+                            </span>
+                            <span className="mt-1 block text-[10.5px] text-slate-500">
+                              {customImage ? customImage.name : 'Imagen destacada de la noticia'}
+                            </span>
+                          </button>
 
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-bold text-slate-700">Cuerpo del Artículo (Párrafos)</label>
-                      <textarea
-                        rows={8}
-                        value={editedContent}
-                        onChange={(e) => setEditedContent(e.target.value)}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-xs text-slate-800 font-mono leading-relaxed focus:outline-none focus:border-[#FF5500]"
-                      />
-                    </div>
+                          <button
+                            type="button"
+                            onClick={() => setCompBase('video')}
+                            className={`rounded-2xl border p-3 text-left transition ${
+                              compBase === 'video'
+                                ? 'border-[#FF5500] bg-orange-50/50 ring-1 ring-[#FF5500]/30'
+                                : 'border-slate-200 hover:border-slate-300'
+                            }`}
+                          >
+                            <span className="flex items-center gap-1.5 text-xs font-black text-slate-800">
+                              <Clapperboard className="w-3.5 h-3.5 text-[#FF5500]" /> Video de composición
+                            </span>
+                            <span className="mt-1 block text-[10.5px] text-slate-500">
+                              {customClip
+                                ? customClip.name
+                                : `Clip automático · ${modalVideoCategory}`}
+                            </span>
+                          </button>
+                        </div>
 
-                    <div className="flex justify-end pt-2">
-                      <button
-                        onClick={handleSaveChanges}
-                        className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-[#FF5500] hover:bg-[#E04B00] text-white text-xs font-bold shadow-md shadow-orange-500/20 transition active:scale-95"
-                      >
-                        <Save className="w-4 h-4" />
-                        <span>Guardar Cambios</span>
-                      </button>
-                    </div>
+                        {/* Importador de la opción seleccionada */}
+                        <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50/60 p-4">
+                          {compBase === 'image' ? (
+                            <div className="space-y-2">
+                              <label
+                                className={`flex w-fit items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-white transition ${
+                                  uploadingMedia === 'image'
+                                    ? 'bg-slate-400 cursor-not-allowed'
+                                    : 'bg-[#FF5500] hover:bg-[#E04B00] cursor-pointer'
+                                }`}
+                              >
+                                <Upload className="w-3.5 h-3.5" />
+                                {uploadingMedia === 'image' ? 'Subiendo imagen...' : 'Importar imagen'}
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  className="hidden"
+                                  disabled={uploadingMedia === 'image'}
+                                  onChange={(e) => handleImportImage(e.target.files?.[0])}
+                                />
+                              </label>
+                              {customImage && (
+                                <button
+                                  onClick={() => setCustomImage(null)}
+                                  className="block text-[11px] font-bold text-slate-500 underline hover:text-slate-800"
+                                >
+                                  Quitar imagen importada — usar la de la noticia
+                                </button>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="space-y-2">
+                              <label
+                                className={`flex w-fit items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-white transition ${
+                                  uploadingMedia === 'video'
+                                    ? 'bg-slate-400 cursor-not-allowed'
+                                    : 'bg-[#FF5500] hover:bg-[#E04B00] cursor-pointer'
+                                }`}
+                              >
+                                <Upload className="w-3.5 h-3.5" />
+                                {uploadingMedia === 'video' ? 'Subiendo video...' : 'Importar video'}
+                                <input
+                                  type="file"
+                                  accept="video/*"
+                                  className="hidden"
+                                  disabled={uploadingMedia === 'video'}
+                                  onChange={(e) => handleImportClip(e.target.files?.[0])}
+                                />
+                              </label>
+                              {customClip && (
+                                <button
+                                  onClick={() => setCustomClip(null)}
+                                  className="block text-[11px] font-bold text-slate-500 underline hover:text-slate-800"
+                                >
+                                  Quitar video importado — usar el clip automático
+                                </button>
+                              )}
+                            </div>
+                          )}
+                          <p className="mt-2 text-[10.5px] text-slate-400">
+                            El archivo importado se aplica tanto a la vista previa como a la
+                            descarga (.mp4) — se regenera el video real automáticamente.
+                          </p>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
-              {/* Right Column: 9:16 Vertical Video Preview (Clean White Container) */}
-              <div className="lg:col-span-5 flex flex-col items-center justify-between p-5 rounded-3xl bg-white border border-slate-200 h-full overflow-hidden shadow-sm">
-                <div className="w-full text-center shrink-0">
-                  <span className="text-xs font-bold text-slate-800 flex items-center justify-center gap-1.5">
-                    <Video className="w-4 h-4 text-[#FF5500]" /> Pieza de Video Vertical 9:16 (10-15s)
-                  </span>
-                </div>
+              {/* Barra de acciones persistente */}
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 bg-white px-4 py-3 sm:px-5 shrink-0">
+                <button
+                  onClick={handleCopyContent}
+                  className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-100 px-3.5 py-2 text-xs font-bold text-slate-800 transition hover:bg-slate-200"
+                >
+                  {copied ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      <span className="text-emerald-700">¡Copiado!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copiar artículo</span>
+                    </>
+                  )}
+                </button>
 
-                {/* Interactive 9:16 Video Player */}
-                <div className="my-auto py-1 flex items-center justify-center">
-                  <VideoPlayerPreview
-                    title={editedTitle || selectedItem.processed?.title || selectedItem.raw?.title || 'Última Hora Puerto Rico'}
-                    category={selectedItem.processed?.category || selectedItem.raw?.category || 'Noticias'}
-                    imageFallback={selectedItem.processed?.featured_image_url || selectedItem.raw?.image_url}
-                    duration={12}
-                    newsId={selectedItem.processed?.id || selectedItem.raw?.id}
-                  />
-                </div>
-
-                <div className="w-full shrink-0 space-y-2 pt-2">
+                <div className="flex items-center gap-2">
                   <button
-                    disabled={isRenderingVideo}
-                    onClick={() => {
-                      const title = editedTitle || selectedItem.processed?.title || selectedItem.raw?.title || 'Noticia Puerto Rico';
-                      const category = selectedItem.processed?.category || selectedItem.raw?.category || 'NOTICIAS';
-                      const image = selectedItem.processed?.featured_image_url || selectedItem.raw?.image_url;
-                      const id = selectedItem.processed?.id || selectedItem.raw?.id;
-                      handleDownloadRealVideo(title, category, image, id);
-                    }}
-                    className={`w-full py-2.5 rounded-2xl text-white text-xs font-black shadow-md transition flex items-center justify-center gap-2 active:scale-95 ${
-                      isRenderingVideo
+                    disabled={videoRenderState.status !== 'ready'}
+                    onClick={() => handleDownloadRealVideo(displayTitle, videoRenderState.url)}
+                    className={`flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-black text-white shadow-md transition active:scale-95 ${
+                      videoRenderState.status !== 'ready'
                         ? 'bg-slate-400 cursor-not-allowed'
                         : 'bg-gradient-to-r from-[#FF5500] to-[#FF7700] hover:from-[#E04B00] hover:to-[#FF6600] shadow-orange-500/20'
                     }`}
                   >
-                    {isRenderingVideo ? (
+                    {videoRenderState.status === 'rendering' ? (
                       <>
-                        <RefreshCw className="w-4 h-4 animate-spin" />
-                        <span>Generando Video 9:16 con FFmpeg...</span>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Generando video...</span>
+                      </>
+                    ) : videoRenderState.status === 'failed' ? (
+                      <>
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Video no disponible</span>
                       </>
                     ) : (
                       <>
-                        <Download className="w-4 h-4" />
+                        <Download className="w-3.5 h-3.5" />
                         <span>Descargar Video (.mp4)</span>
                       </>
                     )}
                   </button>
 
-                  <button
-                    onClick={() => {
-                      if (selectedItem.raw) handleRunPipeline(selectedItem.raw, true);
-                    }}
-                    className="w-full py-2.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black shadow-md shadow-emerald-600/20 transition flex items-center justify-center gap-2 active:scale-95"
-                  >
-                    <UploadCloud className="w-4 h-4" />
-                    <span>Aprobar & Inyectar en WordPress</span>
-                  </button>
+                  {raw && (
+                    <button
+                      onClick={() => handleRunPipeline(raw, true)}
+                      className="flex items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-black text-white shadow-md shadow-emerald-600/20 transition hover:bg-emerald-500 active:scale-95"
+                    >
+                      <UploadCloud className="w-3.5 h-3.5" />
+                      <span>Aprobar &amp; Inyectar en WordPress</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
