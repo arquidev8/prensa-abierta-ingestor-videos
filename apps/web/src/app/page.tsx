@@ -87,7 +87,7 @@ export default function FeedPage() {
   const [customClip, setCustomClip] = useState<{ url: string; name: string } | null>(null);
   const [uploadingMedia, setUploadingMedia] = useState<'image' | 'video' | null>(null);
   // Plantilla de layout del Reel 9:16 (ver .agents/formato-video-reel.md).
-  const [videoTemplate, setVideoTemplate] = useState<'standard' | 'reels-safe'>('standard');
+  const [videoTemplate, setVideoTemplate] = useState<'standard' | 'reels-safe' | 'app-promo'>('standard');
 
   const { getState: getRenderState, ensureRendered } = useVideoRenderCache();
 
@@ -1180,7 +1180,7 @@ export default function FeedPage() {
                               : 'border-slate-200 hover:border-slate-300'
                           }`}
                         >
-                          <span className="block text-xs font-black text-slate-800">Estándar</span>
+                          <span className="block text-xs font-black text-slate-800">Instagram Reels</span>
                           <span className="mt-1 block text-[10.5px] text-slate-500">
                             Titular pegado al borde inferior, ocupa todo el alto 9:16.
                           </span>
@@ -1195,11 +1195,28 @@ export default function FeedPage() {
                           }`}
                         >
                           <span className="block text-xs font-black text-slate-800">
-                            Instagram Reels (Safe Zone)
+                            Cuadricula estandar publicación
                           </span>
                           <span className="mt-1 block text-[10.5px] text-slate-500">
                             Titular elevado a la zona 1:1, logo más separado del borde y los
                             últimos ~15% libres para la UI de Reels.
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setVideoTemplate('app-promo')}
+                          className={`rounded-2xl border p-3 text-left transition ${
+                            videoTemplate === 'app-promo'
+                              ? 'border-[#FF5500] bg-orange-50/50 ring-1 ring-[#FF5500]/30'
+                              : 'border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <span className="block text-xs font-black text-slate-800">
+                            Instagram Reels + App
+                          </span>
+                          <span className="mt-1 block text-[10.5px] text-slate-500">
+                            Igual a "Instagram Reels" pero con el titular más arriba y el banner
+                            "Descarga la App GRATIS" quemado a 16px justo debajo.
                           </span>
                         </button>
                       </div>
@@ -1281,6 +1298,9 @@ export default function FeedPage() {
                                   onChange={(e) => handleImportImage(e.target.files?.[0])}
                                 />
                               </label>
+                              <p className="text-[10px] text-slate-400">
+                                Tamaño usado en la composición: <strong className="font-mono font-bold text-slate-500">1080 × 1920 px</strong> (9:16, vertical). Sube la imagen lo más cercana posible a esa proporción para evitar recortes.
+                              </p>
                               {customImage && (
                                 <button
                                   onClick={() => setCustomImage(null)}
@@ -1309,6 +1329,9 @@ export default function FeedPage() {
                                   onChange={(e) => handleImportClip(e.target.files?.[0])}
                                 />
                               </label>
+                              <p className="text-[10px] text-slate-400">
+                                Tamaño usado en la composición: <strong className="font-mono font-bold text-slate-500">1080 × 1920 px</strong> (9:16, vertical). Sube un clip lo más cercano posible a esa proporción para evitar recortes.
+                              </p>
                               {customClip && (
                                 <button
                                   onClick={() => setCustomClip(null)}

@@ -43,6 +43,22 @@ export function getAssetsContenidoDir(): string {
   return path.resolve(process.cwd(), '../../assets/contenido');
 }
 
+// Resuelve la ruta absoluta a assets/uploads (archivos importados por el usuario
+// desde el "Editor de video" — ver /api/media/upload). Es hermana de
+// assets/contenido, en el mismo volumen `./assets` que comparten los contenedores
+// `web` y `engine` (docker-compose.yml), así que sobreviven a que se recreen los
+// contenedores y el Engine podría leerlos directo del disco si hiciera falta.
+//
+// A propósito NO se sirven desde `public/`: en el build "standalone" de Next.js
+// (usado en el Dockerfile) el servidor resuelve el set de archivos estáticos de
+// `public/` una sola vez al arrancar, así que un archivo escrito ahí en runtime
+// (después de que el proceso ya inició) nunca se vuelve servible — 404 permanente
+// hasta reconstruir la imagen. Por eso se sirven vía un route handler dinámico
+// (`/api/media/uploads/[filename]`), que sí lee el disco en cada request.
+export function getAssetsUploadsDir(): string {
+  return path.join(path.dirname(getAssetsContenidoDir()), 'uploads');
+}
+
 // Normaliza texto eliminando acentos y caracteres especiales para comparaciones
 export function normalizeCategoryString(str: string): string {
   if (!str) return '';
@@ -194,22 +210,37 @@ const FALLBACK_FOLDER = 'Ahora';
 
 /**
  * Mapea una categoría de noticia (venga de la taxonomía que venga) + tags opcionales
- * a UNA de las carpetas canónicas de `assets/contenido`. Nunca devuelve vacío: si
- * nada matchea, devuelve `FALLBACK_FOLDER`.
+ * + el titular opcional a UNA de las carpetas canónicas de `assets/contenido`. Nunca
+ * devuelve vacío: si nada matchea, devuelve `FALLBACK_FOLDER`.
+ *
+ * El titular (`query`) participa en el paso 2 (keywords), NO en el paso 1 (nombre
+ * exacto de carpeta): si la categoría ya es una carpeta canónica ("Deportes"), esa
+ * categorización explícita manda y el titular no la puede overridear. Pero muchas
+ * categorías crudas del feed son genéricas ("General", "Nacional", "Investigación &
+ * Política"…) y no matchean ninguna carpeta ni keyword de categoría — antes, esas
+ * caían siempre a `Ahora` sin mirar el titular, aunque dijera claramente "concierto
+ * de Bad Bunny" o "el tribunal sentenció a…". Incluir el titular en el paso 2 deja
+ * que esas noticias genéricas igual encuentren la carpeta correcta por contenido.
  */
-export function resolveCategoryFolderName(categoryName?: string, tags?: string[]): string {
+export function resolveCategoryFolderName(categoryName?: string, tags?: string[], query?: string): string {
   const norm = normalizeCategoryString(categoryName || '');
-  const haystack = [norm, ...(tags || []).map((t) => normalizeCategoryString(t))]
+  const haystack = [
+    norm,
+    ...(tags || []).map((t) => normalizeCategoryString(t)),
+    normalizeCategoryString(query || ''),
+  ]
     .filter(Boolean)
     .join(' ');
 
-  // 1. Coincidencia directa con el nombre de una carpeta canónica.
+  // 1. Coincidencia directa con el nombre de una carpeta canónica (solo la categoría,
+  //    nunca el titular: una categorización explícita no debe ser overrideada por
+  //    una palabra suelta del titular).
   for (const { folder } of FOLDER_ROUTING) {
     if (norm === normalizeCategoryString(folder)) return folder;
   }
   if (norm === normalizeCategoryString(FALLBACK_FOLDER)) return FALLBACK_FOLDER;
 
-  // 2. Coincidencia por keyword, en orden de prioridad.
+  // 2. Coincidencia por keyword (categoría + tags + titular), en orden de prioridad.
   for (const { folder, keywords } of FOLDER_ROUTING) {
     if (keywords.some((kw) => haystack.includes(kw))) return folder;
   }
@@ -600,10 +631,13 @@ export interface CompositionResolution {
 
 /**
  * Resuelve la composición de b-roll para una noticia, siguiendo la ruta:
- *   1. categoría de la noticia → carpeta en `assets/contenido`.
- *   2. imagen referente en esa carpeta (tema) → si no hay, `imagePexelsQuery`.
+ *   1. categoría de la noticia (+ `query`/titular, si la categoría no matchea
+ *      ninguna carpeta/keyword por sí sola) → carpeta en `assets/contenido`.
+ *   2. imagen referente en esa carpeta (tema, detectado por `query`) → si no hay,
+ *      `imagePexelsQuery`.
  *   3. video de la MISMA carpeta acorde con la noticia (tema → genérico de la carpeta).
- * `query` (titular) determina el tema. Con `seed` (id de la noticia) la elección
+ * `query` (titular) determina tanto la carpeta (paso 1, como red de seguridad) como
+ * el tema dentro de ella (pasos 2-3). Con `seed` (id de la noticia) la elección
  * dentro de la carpeta es determinística (preview == descarga).
  */
 export function resolveComposition(
@@ -620,8 +654,8 @@ export function resolveComposition(
   const byName = (name: string) =>
     folders.find((f) => normalizeCategoryString(f.name) === normalizeCategoryString(name));
 
-  // Paso 1: categoría → carpeta.
-  const targetName = resolveCategoryFolderName(categoryName, tags);
+  // Paso 1: categoría (+ titular, si la categoría es genérica) → carpeta.
+  const targetName = resolveCategoryFolderName(categoryName, tags, query);
   const folder =
     (byName(targetName) && hasAssets(byName(targetName)!) ? byName(targetName) : undefined) ||
     (byName(FALLBACK_FOLDER) && hasAssets(byName(FALLBACK_FOLDER)!) ? byName(FALLBACK_FOLDER) : undefined) ||

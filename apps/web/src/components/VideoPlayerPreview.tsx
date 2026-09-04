@@ -37,7 +37,12 @@ interface VideoPlayerPreviewProps {
   //  - 'reels-safe' → bloque de titular elevado a la safe zone del grid 1:1,
   //    interlineado compacto y logo más separado del borde; los ~15% inferiores
   //    quedan libres para la UI de Instagram Reels.
-  template?: 'standard' | 'reels-safe';
+  //  - 'app-promo'  → como 'standard' pero con el bloque de rótulo+titular más
+  //    arriba y el banner "Descarga la App GRATIS" quemado a 16px justo debajo
+  //    de la última línea del titular. El mockup HTML de este
+  //    componente no reproduce el banner (solo aplica al render real del Engine,
+  //    que es lo que efectivamente se ve cuando se pasa `renderState`).
+  template?: 'standard' | 'reels-safe' | 'app-promo';
   // Estado del render REAL (Go Engine) para esta combinación de ajustes, vía
   // useVideoRenderCache. Cuando se pasa esta prop, el preview reproduce
   // directamente el .mp4 ya renderizado (idéntico al que se descarga) en vez del

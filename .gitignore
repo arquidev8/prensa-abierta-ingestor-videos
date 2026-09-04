@@ -42,8 +42,11 @@ apps/web/public/generated_videos/*
 !apps/web/public/generated_videos/.gitkeep
 **/temp_render/
 
-# Archivos importados desde el "Editor de video" (imagen/video propios del usuario)
-apps/web/public/uploads/
+# Archivos importados desde el "Editor de video" (imagen/video propios del usuario).
+# Viven en assets/uploads (no en public/): ver getAssetsUploadsDir() en
+# lib/contentLibrary.ts — public/ no sirve archivos escritos en runtime en el
+# build "standalone" de Next.js.
+assets/uploads/
 
 # Go engine runtime data & compiled binaries
 services/engine/bin/
