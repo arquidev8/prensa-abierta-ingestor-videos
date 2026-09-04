@@ -25,7 +25,7 @@ services:
       dockerfile: Dockerfile
       args:
         # Usado por el bundle del navegador (build-time); debe ser la URL publicada en el host
-      NEXT_PUBLIC_ENGINE_URL: ${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8080}
+        - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8080}
     container_name: prensa_abierta_web
     ports:
       - "3001:3000"
