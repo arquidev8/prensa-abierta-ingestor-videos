@@ -38,7 +38,7 @@ services:
       # URL por la que el Go Engine puede alcanzar a ESTE servicio (DNS interno de docker),
       # usada para construir clip_urls que el Engine descarga (ver process-news/route.ts y
       # render-video/route.ts). NO puede ser localhost: eso apuntaría al propio contenedor Engine.
-      - WEB_INTERNAL_URL=http://web:3000
+      - WEB_INTERNAL_URL=http://web:8080
       - OLLAMA_CLOUD_BASE_URL=https://api.ollama.com/v1
       - OLLAMA_CLOUD_API_KEY=${OLLAMA_CLOUD_API_KEY}
       - OLLAMA_MODEL=qwen2.5:72b
