@@ -31,6 +31,7 @@ type Engine struct {
 	assetsDir   string
 	outputDir   string
 	defaultLogo string
+	promoImage  string // banner "Descarga la App GRATIS", solo para el template "app-promo"
 
 	mu   sync.Mutex // protege jobs y las mutaciones de sus campos
 	jobs map[string]*models.VideoJob
@@ -43,7 +44,15 @@ type Engine struct {
 // NewEngine creates a new FFmpeg video rendering engine.
 // workerCount define el tamaño del worker pool que limita cuántos renders
 // de FFmpeg corren en paralelo; si es <= 0 se usa un valor por defecto de 2.
-func NewEngine(ffmpegPath, assetsDir, outputDir string, workerCount int) *Engine {
+//
+// logoURL/promoImageURL son opcionales: si vienen configurados (banco de
+// logos migrado a Cloudinary, ver .doc/context.md), el logo/banner se
+// descarga UNA VEZ al arrancar y se cachea en la misma ruta local que ya
+// usa el resto del código (`defaultLogo`/`promoImage`), sin cambiar nada
+// más del pipeline de render. Si la descarga falla o las URLs están
+// vacías, se usa el archivo local existente bajo `assetsDir/logos` (mismo
+// comportamiento que antes de Cloudinary).
+func NewEngine(ffmpegPath, assetsDir, outputDir string, workerCount int, logoURL, promoImageURL string) *Engine {
 	if ffmpegPath == "" {
 		ffmpegPath = os.Getenv("FFMPEG_PATH")
 		if ffmpegPath == "" {
@@ -55,6 +64,10 @@ func NewEngine(ffmpegPath, assetsDir, outputDir string, workerCount int) *Engine
 	_ = os.MkdirAll(assetsDir, 0755)
 
 	logoPath := filepath.Join(assetsDir, "logos", "prensa_abierta_logo.png")
+	promoPath := filepath.Join(assetsDir, "logos", "descargar-app-gratis.jpg")
+
+	downloadAssetIfConfigured(logoURL, logoPath)
+	downloadAssetIfConfigured(promoImageURL, promoPath)
 
 	if workerCount <= 0 {
 		workerCount = 2
@@ -65,6 +78,7 @@ func NewEngine(ffmpegPath, assetsDir, outputDir string, workerCount int) *Engine
 		assetsDir:     assetsDir,
 		outputDir:     outputDir,
 		defaultLogo:   logoPath,
+		promoImage:    promoPath,
 		jobs:          make(map[string]*models.VideoJob),
 		queue:         make(chan string, defaultRenderQueueSize),
 		workerCount:   workerCount,
@@ -317,6 +331,7 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 
 	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(req.Headline), headlineMaxCharsPerLine, headlineMaxLines)
 	lo := layoutFor(req.Template)
+	lo.promoY = computePromoY(lo, cleanHeadline, headlineFontSize)
 
 	videoFilter := strings.Join([]string{
 		// Dark box at bottom for legibility
@@ -330,7 +345,7 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	inputArgs := []string{"-f", "concat", "-safe", "0", "-i", concatListFile}
 	encodeArgs := []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
 
-	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, total, lo.logoY)
+	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, total, lo)
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -340,19 +355,32 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	return nil
 }
 
-// kenBurnsFilter devuelve la cadena de filtros para hacer zoom-in lento (~10% a lo
-// largo de `dur` segundos) sobre una imagen fija: lienzo 1.5x (1620x2880) →
-// `scale:eval=frame` (re-evalúa el factor cada frame según `t`, tope min(t/dur,1))
-// → `crop` central a 1080x1920. NO se usa `zoompan`, que combinado con `-loop 1`
-// dispara muchísimos más frames de los pedidos (bug observado: +1 min de salida
-// para un pedido de 6s).
-func kenBurnsFilter(dur int) string {
+// coverImageFilter encuadra CUALQUIER imagen (retrato, apaisada o cuadrada) en el
+// lienzo vertical 1080x1920 SIN recortar al sujeto: la imagen completa se ajusta
+// centrada (`force_original_aspect_ratio=decrease`) y el espacio sobrante se rellena
+// con una copia ampliada y desenfocada de la misma imagen (estilo Reels/TikTok).
+//
+// Antes se hacía un `crop` central del lienzo lleno (`...=increase,crop`), que
+// cortaba a cualquier sujeto descentrado — p. ej. una foto de agencia donde la
+// persona aparece a un lado (caso reportado: Mbappé quedaba cortado).
+//
+// Se le suma un zoom lento (~6%) para dar algo de movimiento; NO se usa `zoompan`,
+// que combinado con `-loop 1` dispara muchísimos más frames de los pedidos.
+//
+// El string NO lleva prefijo `[0:v]` ni etiqueta final: quien lo use debe
+// anteponer la etiqueta de entrada y encadenar (`,drawtext…`) o etiquetar la
+// salida según su contexto (`-vf`, `-filter_complex`, dentro de buildRenderArgs).
+func coverImageFilter(dur int) string {
 	if dur < 1 {
 		dur = 1
 	}
 	return fmt.Sprintf(
-		"scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,"+
-			"scale=w='1080*(1+0.10*min(t/%d,1))':h='1920*(1+0.10*min(t/%d,1))':eval=frame,"+
+		"split=2[cf_bg][cf_fg];"+
+			"[cf_bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"+
+			"boxblur=luma_radius=20:luma_power=2,eq=brightness=-0.12:saturation=0.85[cf_bgb];"+
+			"[cf_fg]scale=1080:1920:force_original_aspect_ratio=decrease[cf_fgf];"+
+			"[cf_bgb][cf_fgf]overlay=(W-w)/2:(H-h)/2,"+
+			"scale=w='1080*(1+0.06*min(t/%d,1))':h='1920*(1+0.06*min(t/%d,1))':eval=frame,"+
 			"crop=1080:1920,setsar=1",
 		dur, dur,
 	)
@@ -375,7 +403,9 @@ func (e *Engine) prepareImageSegment(ctx context.Context, tempDir, imageURL stri
 		"-y",
 		"-loop", "1", "-t", fmt.Sprintf("%.2f", sec),
 		"-i", localImg,
-		"-vf", kenBurnsFilter(secInt) + ",fps=30,format=yuv420p",
+		// -filter_complex (no -vf) porque coverImageFilter usa split/overlay.
+		"-filter_complex", "[0:v]" + coverImageFilter(secInt) + ",fps=30,format=yuv420p[cf_out]",
+		"-map", "[cf_out]",
 		"-c:v", "libx264", "-preset", "ultrafast",
 		"-pix_fmt", "yuv420p",
 		"-an",
@@ -411,9 +441,10 @@ func (e *Engine) renderImageZoomVideo(ctx context.Context, job *models.VideoJob,
 
 	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(req.Headline), headlineMaxCharsPerLine, headlineMaxLines)
 	lo := layoutFor(req.Template)
+	lo.promoY = computePromoY(lo, cleanHeadline, headlineFontSize)
 
 	videoFilter := strings.Join([]string{
-		kenBurnsFilter(duration),
+		coverImageFilter(duration),
 		fmt.Sprintf("drawbox=y=%s:color=black@0.85:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
 		categoryHeaderFilters(req.Category, lo),
 		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=%s:line_spacing=%d:fix_bounds=true", cleanHeadline, lo.headY, lo.headLineSpacing),
@@ -422,7 +453,7 @@ func (e *Engine) renderImageZoomVideo(ctx context.Context, job *models.VideoJob,
 	inputArgs := []string{"-loop", "1", "-t", fmt.Sprintf("%d", duration), "-i", localImagePath}
 	encodeArgs := []string{"-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
 
-	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration, lo.logoY)
+	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration, lo)
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -470,6 +501,55 @@ func (e *Engine) downloadToTempFile(ctx context.Context, url string) (string, er
 	return tmpFile.Name(), nil
 }
 
+// downloadAssetIfConfigured descarga `url` a `dest` (sobreescribiendo lo que
+// haya) si `url` no está vacía. Se usa solo en el arranque, para cachear
+// localmente el logo/banner cuando el banco de medios vive en Cloudinary —
+// así el overlay de FFmpeg sigue usando una ruta de archivo local (más
+// simple y rápido que pasarle una URL remota por render). Si falla, se
+// registra un warning y se deja el archivo local existente tal cual (si lo
+// hay), sin interrumpir el arranque del servidor.
+func downloadAssetIfConfigured(url, dest string) {
+	if url == "" {
+		return
+	}
+	if err := downloadFileTo(url, dest); err != nil {
+		log.Printf("[VideoEngine] no se pudo descargar %s: %v (se usará el archivo local existente en %s, si lo hay)", url, err, dest)
+	} else {
+		log.Printf("[VideoEngine] asset descargado desde Cloudinary → %s", dest)
+	}
+}
+
+func downloadFileTo(url, dest string) error {
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("status HTTP %d al descargar %s", resp.StatusCode, url)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		return err
+	}
+
+	tmp := dest + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	f.Close()
+
+	return os.Rename(tmp, dest)
+}
+
 // renderFallbackColorVideo es el último recurso cuando no hay ni clip de video ni
 // imagen destacada: un video de color de marca con el titular quemado.
 func (e *Engine) renderFallbackColorVideo(ctx context.Context, job *models.VideoJob, outputPath string) error {
@@ -480,6 +560,7 @@ func (e *Engine) renderFallbackColorVideo(ctx context.Context, job *models.Video
 		duration = 12
 	}
 	lo := layoutFor(req.Template)
+	lo.promoY = computePromoY(lo, cleanHeadline, 40)
 
 	videoFilter := strings.Join([]string{
 		fmt.Sprintf("drawbox=y=%s:color=black@0.78:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
@@ -490,7 +571,7 @@ func (e *Engine) renderFallbackColorVideo(ctx context.Context, job *models.Video
 	inputArgs := []string{"-f", "lavfi", "-i", fmt.Sprintf("color=c=0x1a1a2e:s=1080x1920:d=%d:r=30", duration)}
 	encodeArgs := []string{"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"}
 
-	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration, lo.logoY)
+	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration, lo)
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -500,41 +581,87 @@ func (e *Engine) renderFallbackColorVideo(ctx context.Context, job *models.Video
 }
 
 // buildRenderArgs arma los argumentos de FFmpeg combinando el/los input(s) de video
-// ya provistos (inputArgs) con el filtro de escalado/overlay (videoFilter, SIN el
-// overlay del logo) y, si existe el archivo del logo de Prensa Abierta en disco, lo
-// agrega como segundo input y usa -filter_complex en vez de -vf para superponerlo
-// en la esquina superior derecha. Se reutiliza en los 3 modos de render (clips
-// reales, imagen de respaldo, color de marca) para no triplicar esta lógica.
+// ya provistos (inputArgs) con el filtro de escalado/overlay (videoFilter, SIN los
+// overlays de logo/banner) y agrega como inputs adicionales — vía -filter_complex —
+// el logo de Prensa Abierta (si existe en disco) y, si la plantilla lo pide
+// (overlayLayout.showPromo), el banner "Descarga la App GRATIS". Se reutiliza en
+// los 3 modos de render (clips reales, imagen de respaldo, color de marca) para no
+// triplicar esta lógica.
 //
 // durationSec es la duración objetivo del video base: se usa para acotar
-// explícitamente el input del logo con "-t". Sin esto (probado en la práctica),
-// el logo -loop 1 queda sin límite de duración y el render corre indefinidamente
-// hasta que el timeout del worker lo mata ("signal: killed"), en vez de terminar
-// cuando termina el video base.
+// explícitamente los inputs en loop (logo/banner) con "-t". Sin esto (probado en
+// la práctica), un input -loop 1 queda sin límite de duración y el render corre
+// indefinidamente hasta que el timeout del worker lo mata ("signal: killed"), en
+// vez de terminar cuando termina el video base.
 //
-// El input del logo se acota a durationSec + 2 como margen de seguridad, pero el
-// overlay lleva `shortest=1` para que la salida termine EXACTAMENTE cuando termina
-// el video base (el input más corto) y no cuando termina el logo — sin esto, la
-// salida quedaba ~2s más larga de lo pedido con el b-roll congelado en su último
-// frame durante esa cola.
-func (e *Engine) buildRenderArgs(inputArgs []string, videoFilter string, outputPath string, encodeArgs []string, durationSec int, logoY int) []string {
+// Los inputs en loop se acotan a durationSec + 2 como margen de seguridad, pero el
+// overlay final lleva `shortest=1` para que la salida termine EXACTAMENTE cuando
+// termina el video base (el input más corto) y no cuando terminan ellos — sin
+// esto, la salida quedaba ~2s más larga de lo pedido con el b-roll congelado en su
+// último frame durante esa cola.
+func (e *Engine) buildRenderArgs(inputArgs []string, videoFilter string, outputPath string, encodeArgs []string, durationSec int, lo overlayLayout) []string {
 	args := append([]string{"-y"}, inputArgs...)
 
+	logoY := lo.logoY
 	if logoY <= 0 {
 		logoY = 92
 	}
+	promoWidth := lo.promoWidth
+	if promoWidth <= 0 {
+		promoWidth = 560
+	}
+	promoMargin := lo.promoBottomMargin
+	if promoMargin <= 0 {
+		promoMargin = 34
+	}
 
-	if fileExists(e.defaultLogo) {
+	hasLogo := fileExists(e.defaultLogo)
+	hasPromo := lo.showPromo && fileExists(e.promoImage)
+
+	// Posición Y del banner: si computePromoY() pudo calcularla (promoGapBelowHeadline
+	// px debajo de la última línea del titular ya envuelto) se usa ese píxel literal;
+	// si no (plantilla sin headYOffset), se cae al ancla del borde inferior de siempre.
+	promoYExpr := fmt.Sprintf("H-h-%d", promoMargin)
+	if lo.promoY > 0 {
+		promoYExpr = fmt.Sprintf("%d", lo.promoY)
+	}
+
+	safeDuration := durationSec + 2 // margen de seguridad por encima del video base
+	if safeDuration <= 2 {
+		safeDuration = 15
+	}
+	loopInput := func(imgPath string) []string {
+		return []string{"-loop", "1", "-t", fmt.Sprintf("%d", safeDuration), "-i", imgPath}
+	}
+
+	switch {
+	case hasLogo && hasPromo:
+		filterComplex := fmt.Sprintf(
+			"[0:v]%s[vout];"+
+				"[1:v]scale=240:240[logo];"+
+				"[vout][logo]overlay=x=W-w-60:y=%d:shortest=1[vlogo];"+
+				"[2:v]scale=%d:-1[promo];"+
+				"[vlogo][promo]overlay=x=(W-w)/2:y=%s:shortest=1[vfinal]",
+			videoFilter, logoY, promoWidth, promoYExpr,
+		)
+		args = append(args, loopInput(e.defaultLogo)...)
+		args = append(args, loopInput(e.promoImage)...)
+		args = append(args, "-filter_complex", filterComplex, "-map", "[vfinal]")
+	case hasLogo:
 		filterComplex := fmt.Sprintf(
 			"[0:v]%s[vout];[1:v]scale=240:240[logo];[vout][logo]overlay=x=W-w-60:y=%d:shortest=1[vfinal]",
 			videoFilter, logoY,
 		)
-		safeDuration := durationSec + 2 // margen de seguridad por encima del video base
-		if safeDuration <= 2 {
-			safeDuration = 15
-		}
-		args = append(args, "-loop", "1", "-t", fmt.Sprintf("%d", safeDuration), "-i", e.defaultLogo, "-filter_complex", filterComplex, "-map", "[vfinal]")
-	} else {
+		args = append(args, loopInput(e.defaultLogo)...)
+		args = append(args, "-filter_complex", filterComplex, "-map", "[vfinal]")
+	case hasPromo:
+		filterComplex := fmt.Sprintf(
+			"[0:v]%s[vout];[1:v]scale=%d:-1[promo];[vout][promo]overlay=x=(W-w)/2:y=%s:shortest=1[vfinal]",
+			videoFilter, promoWidth, promoYExpr,
+		)
+		args = append(args, loopInput(e.promoImage)...)
+		args = append(args, "-filter_complex", filterComplex, "-map", "[vfinal]")
+	default:
 		args = append(args, "-vf", videoFilter)
 	}
 
@@ -552,36 +679,103 @@ func fileExists(path string) bool {
 }
 
 // overlayLayout agrupa las coordenadas de los overlays inferiores (caja oscura,
-// rótulo de categoría, titular) y del logo, para poder cambiarlas según la
-// plantilla elegida (models.VideoRenderRequest.Template) sin duplicar la lógica en
-// los 3 modos de render.
+// rótulo de categoría, titular), del logo y del banner promocional opcional, para
+// poder cambiarlas según la plantilla elegida (models.VideoRenderRequest.Template)
+// sin duplicar la lógica en los 3 modos de render.
 type overlayLayout struct {
 	boxY, boxH        string // ej. "ih-520", "520"
 	catDotY, catTextY string // ej. "h-441", "h-440"
 	headY             string // ej. "h-370"
+	headYOffset       int    // mismo valor que headY pero numérico (distancia en px desde el borde inferior del lienzo de 1920px) — permite calcular dónde termina el titular para ubicar el banner promocional con un espaciado exacto.
 	headLineSpacing   int
 	logoY             int
+
+	// Banner "Descarga la App GRATIS" (assets/logos/descargar-app-gratis.jpg),
+	// centrado horizontalmente. Solo lo usa la plantilla "app-promo".
+	showPromo         bool
+	promoWidth        int // ancho al que se escala (alto = automático, mantiene aspecto)
+	promoBottomMargin int // fallback: anclado al borde inferior si no se pudo calcular promoY
+	promoY            int // posición Y calculada (computePromoY): promoGapBelowHeadline px debajo de la última línea del titular
+}
+
+// canvasHeight es la altura fija del lienzo de salida (1080x1920, 9:16) — todos los
+// renders escalan/recortan a esta resolución, así que las cuentas de posición del
+// banner promocional pueden hacerse con este valor literal en vez de la expresión
+// `h` de FFmpeg (que también vale 1920, pero como número no permite aritmética en Go).
+const canvasHeight = 1920
+
+// promoGapBelowHeadline es la separación pedida entre la última línea del titular y
+// el borde superior del banner "Descarga la App GRATIS" (plantilla "app-promo").
+const promoGapBelowHeadline = 16
+
+// computePromoY calcula, en píxeles absolutos, dónde debe empezar el banner
+// promocional para quedar `promoGapBelowHeadline` px debajo de la ÚLTIMA línea del
+// titular ya envuelto (`cleanHeadline`, con saltos de línea reales de
+// wrapTextForDrawtext) — el titular tiene 1 a headlineMaxLines líneas según lo
+// largo que sea, así que esta posición varía por noticia, no es un valor fijo.
+//
+// fontSize + lo.headLineSpacing aproxima el "line pitch" real que usa drawtext
+// (altura de línea de DejaVu Sans Bold al fontsize del titular + el interlineado
+// explícito de la plantilla) — calibrado visualmente con Docker real. Se recibe
+// `fontSize` porque el titular no usa siempre el mismo tamaño: 46 en el render con
+// clips/imagen, 40 en el fallback de color de marca.
+func computePromoY(lo overlayLayout, cleanHeadline string, fontSize int) int {
+	if !lo.showPromo || lo.headYOffset <= 0 {
+		return 0
+	}
+	lines := strings.Count(cleanHeadline, "\n") + 1
+	linePitch := fontSize + lo.headLineSpacing
+	headlineTop := canvasHeight - lo.headYOffset
+	headlineBottom := headlineTop + lines*linePitch
+	return headlineBottom + promoGapBelowHeadline
 }
 
 // layoutFor traduce el nombre de plantilla a coordenadas concretas de overlay.
+//
 // "reels-safe" (ver .agents/formato-video-reel.md): sube el bloque de titular a la
 // safe zone del grid 1:1 (Y:1050–1450 en un lienzo de 1920), deja libres los
 // ~430px inferiores para la UI de Reels, separa el logo ≥180px del borde superior
 // y compacta el interlineado.
+//
+// "app-promo": layout basado en "standard" (mismo interlineado) pero con el
+// rótulo+titular subidos 84px en total (offset-desde-el-borde +84: h-441→h-525,
+// h-440→h-524, h-370→h-454 — 24px del ajuste inicial + 60px más a pedido del
+// usuario) para dejar sitio, justo debajo, al banner "Descarga la App GRATIS" —
+// que se posiciona dinámicamente (ver computePromoY) a promoGapBelowHeadline
+// (16px) de la última línea del titular, sea cual sea su largo. La caja oscura
+// (boxY/boxH) se estiró esos mismos 84px (520→604) para que siga cubriendo el
+// rótulo "ULTIMA HORA • CATEGORÍA" con el mismo margen de 79px que tenía en
+// "standard" — si solo se sube el texto sin estirar la caja, el rótulo queda
+// por encima del borde superior de la caja y se ve "cortado".
 func layoutFor(template string) overlayLayout {
 	if template == "reels-safe" {
 		return overlayLayout{
 			boxY: "ih-880", boxH: "440",
 			catDotY: "h-801", catTextY: "h-800",
 			headY:           "h-740",
+			headYOffset:     740,
 			headLineSpacing: 10,
 			logoY:           190,
+		}
+	}
+	if template == "app-promo" {
+		return overlayLayout{
+			boxY: "ih-604", boxH: "604",
+			catDotY: "h-525", catTextY: "h-524",
+			headY:           "h-454",
+			headYOffset:     454,
+			headLineSpacing: 18,
+			logoY:           92,
+			showPromo:         true,
+			promoWidth:        560,
+			promoBottomMargin: 34,
 		}
 	}
 	return overlayLayout{
 		boxY: "ih-520", boxH: "520",
 		catDotY: "h-441", catTextY: "h-440",
 		headY:           "h-370",
+		headYOffset:     370,
 		headLineSpacing: 18,
 		logoY:           92,
 	}
@@ -624,6 +818,9 @@ const (
 	// dejaba un hueco grande a la derecha.
 	headlineMaxCharsPerLine = 38
 	headlineMaxLines        = 4
+	// Tamaño de fuente del titular en los 3 modos de render (drawtext fontsize=46).
+	// Se reutiliza en computePromoY para estimar el alto de línea real.
+	headlineFontSize = 46
 )
 
 // sanitizeTextForFFmpeg escapa caracteres especiales del filtro drawtext (comillas,

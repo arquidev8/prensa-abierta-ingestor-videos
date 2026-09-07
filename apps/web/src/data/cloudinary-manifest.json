@@ -1,0 +1,580 @@
+{
+  "generatedAt": "2026-09-07T16:51:46.142Z",
+  "folders": {
+    "Ahora": {
+      "videos": [
+        {
+          "fileName": "Ahora 2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798621/prensa-abierta/contenido/Ahora/Ahora%202.mp4",
+          "publicId": "prensa-abierta/contenido/Ahora/Ahora 2",
+          "format": "mp4",
+          "bytes": 5944660
+        },
+        {
+          "fileName": "Ahora 3.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798623/prensa-abierta/contenido/Ahora/Ahora%203.mp4",
+          "publicId": "prensa-abierta/contenido/Ahora/Ahora 3",
+          "format": "mp4",
+          "bytes": 2190889
+        },
+        {
+          "fileName": "Ahora 5.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798625/prensa-abierta/contenido/Ahora/Ahora%205.mp4",
+          "publicId": "prensa-abierta/contenido/Ahora/Ahora 5",
+          "format": "mp4",
+          "bytes": 4044760
+        },
+        {
+          "fileName": "Ahora-4.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798630/prensa-abierta/contenido/Ahora/Ahora-4.mp4",
+          "publicId": "prensa-abierta/contenido/Ahora/Ahora-4",
+          "format": "mp4",
+          "bytes": 10680919
+        },
+        {
+          "fileName": "Ahora-entrevista.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798632/prensa-abierta/contenido/Ahora/Ahora-entrevista.mp4",
+          "publicId": "prensa-abierta/contenido/Ahora/Ahora-entrevista",
+          "format": "mp4",
+          "bytes": 4593283
+        }
+      ],
+      "images": []
+    },
+    "Deportes": {
+      "videos": [
+        {
+          "fileName": "Deportes-atletismo.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798680/prensa-abierta/contenido/Deportes/Deportes-atletismo.mp4",
+          "publicId": "prensa-abierta/contenido/Deportes/Deportes-atletismo",
+          "format": "mp4",
+          "bytes": 30199201
+        },
+        {
+          "fileName": "Deportes-baseball.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798686/prensa-abierta/contenido/Deportes/Deportes-baseball.mp4",
+          "publicId": "prensa-abierta/contenido/Deportes/Deportes-baseball",
+          "format": "mp4",
+          "bytes": 7919981
+        },
+        {
+          "fileName": "Deportes-basket.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798719/prensa-abierta/contenido/Deportes/Deportes-basket.mp4",
+          "publicId": "prensa-abierta/contenido/Deportes/Deportes-basket",
+          "format": "mp4",
+          "bytes": 102188951
+        },
+        {
+          "fileName": "Deportes-contacto-boxeo.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798725/prensa-abierta/contenido/Deportes/Deportes-contacto-boxeo.mp4",
+          "publicId": "prensa-abierta/contenido/Deportes/Deportes-contacto-boxeo",
+          "format": "mp4",
+          "bytes": 7809277
+        }
+      ],
+      "images": [
+        {
+          "fileName": "Deportes-baseball-complemento.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798681/prensa-abierta/contenido/Deportes/Deportes-baseball-complemento.jpg",
+          "publicId": "prensa-abierta/contenido/Deportes/Deportes-baseball-complemento",
+          "format": "jpg",
+          "bytes": 136444
+        },
+        {
+          "fileName": "Deportes-biker.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798722/prensa-abierta/contenido/Deportes/Deportes-biker.jpg",
+          "publicId": "prensa-abierta/contenido/Deportes/Deportes-biker",
+          "format": "jpg",
+          "bytes": 83991
+        },
+        {
+          "fileName": "Deportes-ciclismo.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798722/prensa-abierta/contenido/Deportes/Deportes-ciclismo.jpg",
+          "publicId": "prensa-abierta/contenido/Deportes/Deportes-ciclismo",
+          "format": "jpg",
+          "bytes": 117217
+        }
+      ]
+    },
+    "Economía": {
+      "videos": [
+        {
+          "fileName": "Economía 1.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798775/prensa-abierta/contenido/Econom%C3%ADa/Econom%C3%ADa%201.mp4",
+          "publicId": "prensa-abierta/contenido/Economía/Economía 1",
+          "format": "mp4",
+          "bytes": 43725317
+        },
+        {
+          "fileName": "Economía 2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798778/prensa-abierta/contenido/Econom%C3%ADa/Econom%C3%ADa%202.mp4",
+          "publicId": "prensa-abierta/contenido/Economía/Economía 2",
+          "format": "mp4",
+          "bytes": 4868835
+        },
+        {
+          "fileName": "Economía 3.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798780/prensa-abierta/contenido/Econom%C3%ADa/Econom%C3%ADa%203.mp4",
+          "publicId": "prensa-abierta/contenido/Economía/Economía 3",
+          "format": "mp4",
+          "bytes": 2420444
+        },
+        {
+          "fileName": "Economía 4.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798784/prensa-abierta/contenido/Econom%C3%ADa/Econom%C3%ADa%204.mp4",
+          "publicId": "prensa-abierta/contenido/Economía/Economía 4",
+          "format": "mp4",
+          "bytes": 7439490
+        },
+        {
+          "fileName": "Economía 5.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798787/prensa-abierta/contenido/Econom%C3%ADa/Econom%C3%ADa%205.mp4",
+          "publicId": "prensa-abierta/contenido/Economía/Economía 5",
+          "format": "mp4",
+          "bytes": 5494040
+        }
+      ],
+      "images": [
+        {
+          "fileName": "Economia-cryptos-2.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798763/prensa-abierta/contenido/Econom%C3%ADa/Economia-cryptos-2.jpg",
+          "publicId": "prensa-abierta/contenido/Economía/Economia-cryptos-2",
+          "format": "jpg",
+          "bytes": 226167
+        },
+        {
+          "fileName": "Economia-cryptos.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798764/prensa-abierta/contenido/Econom%C3%ADa/Economia-cryptos.jpg",
+          "publicId": "prensa-abierta/contenido/Economía/Economia-cryptos",
+          "format": "jpg",
+          "bytes": 309591
+        }
+      ]
+    },
+    "Estados Unidos": {
+      "videos": [
+        {
+          "fileName": "Estados Unidos 1.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798792/prensa-abierta/contenido/Estados%20Unidos/Estados%20Unidos%201.mp4",
+          "publicId": "prensa-abierta/contenido/Estados Unidos/Estados Unidos 1",
+          "format": "mp4",
+          "bytes": 10277976
+        },
+        {
+          "fileName": "Estados Unidos 2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798798/prensa-abierta/contenido/Estados%20Unidos/Estados%20Unidos%202.mp4",
+          "publicId": "prensa-abierta/contenido/Estados Unidos/Estados Unidos 2",
+          "format": "mp4",
+          "bytes": 16584927
+        },
+        {
+          "fileName": "Estados Unidos 3.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798811/prensa-abierta/contenido/Estados%20Unidos/Estados%20Unidos%203.mp4",
+          "publicId": "prensa-abierta/contenido/Estados Unidos/Estados Unidos 3",
+          "format": "mp4",
+          "bytes": 31377843
+        },
+        {
+          "fileName": "Estados Unidos 4.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798822/prensa-abierta/contenido/Estados%20Unidos/Estados%20Unidos%204.mp4",
+          "publicId": "prensa-abierta/contenido/Estados Unidos/Estados Unidos 4",
+          "format": "mp4",
+          "bytes": 26432690
+        },
+        {
+          "fileName": "Estados Unidos 5.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798831/prensa-abierta/contenido/Estados%20Unidos/Estados%20Unidos%205.mp4",
+          "publicId": "prensa-abierta/contenido/Estados Unidos/Estados Unidos 5",
+          "format": "mp4",
+          "bytes": 24077275
+        }
+      ],
+      "images": []
+    },
+    "Gobierno": {
+      "videos": [
+        {
+          "fileName": "Gobierno 1.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798834/prensa-abierta/contenido/Gobierno/Gobierno%201.mp4",
+          "publicId": "prensa-abierta/contenido/Gobierno/Gobierno 1",
+          "format": "mp4",
+          "bytes": 4843835
+        },
+        {
+          "fileName": "Gobierno 2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798837/prensa-abierta/contenido/Gobierno/Gobierno%202.mp4",
+          "publicId": "prensa-abierta/contenido/Gobierno/Gobierno 2",
+          "format": "mp4",
+          "bytes": 2596427
+        },
+        {
+          "fileName": "Gobierno 5.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798840/prensa-abierta/contenido/Gobierno/Gobierno%205.mp4",
+          "publicId": "prensa-abierta/contenido/Gobierno/Gobierno 5",
+          "format": "mp4",
+          "bytes": 3865694
+        },
+        {
+          "fileName": "Gobierno-3.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798847/prensa-abierta/contenido/Gobierno/Gobierno-3.mp4",
+          "publicId": "prensa-abierta/contenido/Gobierno/Gobierno-3",
+          "format": "mp4",
+          "bytes": 14788150
+        },
+        {
+          "fileName": "Gobierno-4.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798854/prensa-abierta/contenido/Gobierno/Gobierno-4.mp4",
+          "publicId": "prensa-abierta/contenido/Gobierno/Gobierno-4",
+          "format": "mp4",
+          "bytes": 18950059
+        }
+      ],
+      "images": []
+    },
+    "Internacional": {
+      "videos": [
+        {
+          "fileName": "Internacional 1.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798858/prensa-abierta/contenido/Internacional/Internacional%201.mp4",
+          "publicId": "prensa-abierta/contenido/Internacional/Internacional 1",
+          "format": "mp4",
+          "bytes": 5256118
+        },
+        {
+          "fileName": "Internacional 2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798864/prensa-abierta/contenido/Internacional/Internacional%202.mp4",
+          "publicId": "prensa-abierta/contenido/Internacional/Internacional 2",
+          "format": "mp4",
+          "bytes": 13647498
+        },
+        {
+          "fileName": "Internacional 3.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798876/prensa-abierta/contenido/Internacional/Internacional%203.mp4",
+          "publicId": "prensa-abierta/contenido/Internacional/Internacional 3",
+          "format": "mp4",
+          "bytes": 23779607
+        },
+        {
+          "fileName": "Internacional 4.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798880/prensa-abierta/contenido/Internacional/Internacional%204.mp4",
+          "publicId": "prensa-abierta/contenido/Internacional/Internacional 4",
+          "format": "mp4",
+          "bytes": 6118530
+        }
+      ],
+      "images": [
+        {
+          "fileName": "Internacional-organizacion.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798915/prensa-abierta/contenido/Internacional/Internacional-organizacion.jpg",
+          "publicId": "prensa-abierta/contenido/Internacional/Internacional-organizacion",
+          "format": "jpg",
+          "bytes": 169753
+        },
+        {
+          "fileName": "Internacional-reunion.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798915/prensa-abierta/contenido/Internacional/Internacional-reunion.jpg",
+          "publicId": "prensa-abierta/contenido/Internacional/Internacional-reunion",
+          "format": "jpg",
+          "bytes": 247895
+        }
+      ]
+    },
+    "Local": {
+      "videos": [
+        {
+          "fileName": "Local 1.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798928/prensa-abierta/contenido/Local/Local%201.mp4",
+          "publicId": "prensa-abierta/contenido/Local/Local 1",
+          "format": "mp4",
+          "bytes": 38838763
+        },
+        {
+          "fileName": "Local 2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798935/prensa-abierta/contenido/Local/Local%202.mp4",
+          "publicId": "prensa-abierta/contenido/Local/Local 2",
+          "format": "mp4",
+          "bytes": 14980526
+        },
+        {
+          "fileName": "Local 3.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798940/prensa-abierta/contenido/Local/Local%203.mp4",
+          "publicId": "prensa-abierta/contenido/Local/Local 3",
+          "format": "mp4",
+          "bytes": 9309102
+        },
+        {
+          "fileName": "Local 4.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798945/prensa-abierta/contenido/Local/Local%204.mp4",
+          "publicId": "prensa-abierta/contenido/Local/Local 4",
+          "format": "mp4",
+          "bytes": 8988737
+        },
+        {
+          "fileName": "Local 5.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798956/prensa-abierta/contenido/Local/Local%205.mp4",
+          "publicId": "prensa-abierta/contenido/Local/Local 5",
+          "format": "mp4",
+          "bytes": 24648069
+        }
+      ],
+      "images": [
+        {
+          "fileName": "Local-6.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798957/prensa-abierta/contenido/Local/Local-6.jpg",
+          "publicId": "prensa-abierta/contenido/Local/Local-6",
+          "format": "jpg",
+          "bytes": 331194
+        },
+        {
+          "fileName": "Local-gobernadora-2.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798958/prensa-abierta/contenido/Local/Local-gobernadora-2.jpg",
+          "publicId": "prensa-abierta/contenido/Local/Local-gobernadora-2",
+          "format": "jpg",
+          "bytes": 73882
+        },
+        {
+          "fileName": "Local-gobernadora-3.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798958/prensa-abierta/contenido/Local/Local-gobernadora-3.jpg",
+          "publicId": "prensa-abierta/contenido/Local/Local-gobernadora-3",
+          "format": "jpg",
+          "bytes": 101291
+        },
+        {
+          "fileName": "Local-gobernadora-4.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798959/prensa-abierta/contenido/Local/Local-gobernadora-4.jpg",
+          "publicId": "prensa-abierta/contenido/Local/Local-gobernadora-4",
+          "format": "jpg",
+          "bytes": 171211
+        },
+        {
+          "fileName": "Local-gobernadora.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798959/prensa-abierta/contenido/Local/Local-gobernadora.jpg",
+          "publicId": "prensa-abierta/contenido/Local/Local-gobernadora",
+          "format": "jpg",
+          "bytes": 158323
+        }
+      ]
+    },
+    "Musica": {
+      "videos": [
+        {
+          "fileName": "Musica-clasica-concierto.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798965/prensa-abierta/contenido/Musica/Musica-clasica-concierto.mp4",
+          "publicId": "prensa-abierta/contenido/Musica/Musica-clasica-concierto",
+          "format": "mp4",
+          "bytes": 8132412
+        },
+        {
+          "fileName": "Musica-clasica.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798968/prensa-abierta/contenido/Musica/Musica-clasica.mp4",
+          "publicId": "prensa-abierta/contenido/Musica/Musica-clasica",
+          "format": "mp4",
+          "bytes": 5822493
+        },
+        {
+          "fileName": "Musica-concierto-2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798972/prensa-abierta/contenido/Musica/Musica-concierto-2.mp4",
+          "publicId": "prensa-abierta/contenido/Musica/Musica-concierto-2",
+          "format": "mp4",
+          "bytes": 4912662
+        },
+        {
+          "fileName": "Musica-concierto.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798975/prensa-abierta/contenido/Musica/Musica-concierto.mp4",
+          "publicId": "prensa-abierta/contenido/Musica/Musica-concierto",
+          "format": "mp4",
+          "bytes": 4463674
+        }
+      ],
+      "images": [
+        {
+          "fileName": "Musica-bad-bunny-2.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798960/prensa-abierta/contenido/Musica/Musica-bad-bunny-2.jpg",
+          "publicId": "prensa-abierta/contenido/Musica/Musica-bad-bunny-2",
+          "format": "jpg",
+          "bytes": 74597
+        },
+        {
+          "fileName": "Musica-bad-bunny-3.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798961/prensa-abierta/contenido/Musica/Musica-bad-bunny-3.jpg",
+          "publicId": "prensa-abierta/contenido/Musica/Musica-bad-bunny-3",
+          "format": "jpg",
+          "bytes": 82103
+        },
+        {
+          "fileName": "Musica-bad-bunny-4.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798961/prensa-abierta/contenido/Musica/Musica-bad-bunny-4.jpg",
+          "publicId": "prensa-abierta/contenido/Musica/Musica-bad-bunny-4",
+          "format": "jpg",
+          "bytes": 48597
+        },
+        {
+          "fileName": "Musica-bad-bunny.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798962/prensa-abierta/contenido/Musica/Musica-bad-bunny.jpg",
+          "publicId": "prensa-abierta/contenido/Musica/Musica-bad-bunny",
+          "format": "jpg",
+          "bytes": 183422
+        }
+      ]
+    },
+    "Salud": {
+      "videos": [
+        {
+          "fileName": "Salud-acupuntura-video.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798976/prensa-abierta/contenido/Salud/Salud-acupuntura-video.mp4",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-acupuntura-video",
+          "format": "mp4",
+          "bytes": 1866183
+        },
+        {
+          "fileName": "Salud-acupuntura.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798978/prensa-abierta/contenido/Salud/Salud-acupuntura.mp4",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-acupuntura",
+          "format": "mp4",
+          "bytes": 1648550
+        },
+        {
+          "fileName": "Salud-enfermedad.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798980/prensa-abierta/contenido/Salud/Salud-enfermedad.mp4",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-enfermedad",
+          "format": "mp4",
+          "bytes": 3269709
+        },
+        {
+          "fileName": "Salud-medicina.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798983/prensa-abierta/contenido/Salud/Salud-medicina.mp4",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-medicina",
+          "format": "mp4",
+          "bytes": 2431556
+        },
+        {
+          "fileName": "Salud-medicinas-2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798985/prensa-abierta/contenido/Salud/Salud-medicinas-2.mp4",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-medicinas-2",
+          "format": "mp4",
+          "bytes": 3334546
+        },
+        {
+          "fileName": "Salud-procedimientos.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798987/prensa-abierta/contenido/Salud/Salud-procedimientos.mp4",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-procedimientos",
+          "format": "mp4",
+          "bytes": 1270926
+        }
+      ],
+      "images": [
+        {
+          "fileName": "Salud-enfermedades.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798981/prensa-abierta/contenido/Salud/Salud-enfermedades.jpg",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-enfermedades",
+          "format": "jpg",
+          "bytes": 220611
+        },
+        {
+          "fileName": "Salud-laboratorios.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798981/prensa-abierta/contenido/Salud/Salud-laboratorios.jpg",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-laboratorios",
+          "format": "jpg",
+          "bytes": 151551
+        },
+        {
+          "fileName": "Salud-medicinas.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788798986/prensa-abierta/contenido/Salud/Salud-medicinas.jpg",
+          "publicId": "prensa-abierta/contenido/Salud/Salud-medicinas",
+          "format": "jpg",
+          "bytes": 225880
+        }
+      ]
+    },
+    "Sucesos": {
+      "videos": [
+        {
+          "fileName": "Sucesos 1.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798991/prensa-abierta/contenido/Sucesos/Sucesos%201.mp4",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos 1",
+          "format": "mp4",
+          "bytes": 12888798
+        },
+        {
+          "fileName": "Sucesos 2.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798994/prensa-abierta/contenido/Sucesos/Sucesos%202.mp4",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos 2",
+          "format": "mp4",
+          "bytes": 5776145
+        },
+        {
+          "fileName": "Sucesos 3.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788798996/prensa-abierta/contenido/Sucesos/Sucesos%203.mp4",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos 3",
+          "format": "mp4",
+          "bytes": 3608578
+        },
+        {
+          "fileName": "Sucesos 4.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788799000/prensa-abierta/contenido/Sucesos/Sucesos%204.mp4",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos 4",
+          "format": "mp4",
+          "bytes": 7786942
+        },
+        {
+          "fileName": "Sucesos 5.mp4",
+          "url": "https://res.cloudinary.com/yobvezme/video/upload/v1788799004/prensa-abierta/contenido/Sucesos/Sucesos%205.mp4",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos 5",
+          "format": "mp4",
+          "bytes": 7420468
+        }
+      ],
+      "images": [
+        {
+          "fileName": "Sucesos-accidentes.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788799006/prensa-abierta/contenido/Sucesos/Sucesos-accidentes.jpg",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos-accidentes",
+          "format": "jpg",
+          "bytes": 255636
+        },
+        {
+          "fileName": "Sucesos-crimen.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788799006/prensa-abierta/contenido/Sucesos/Sucesos-crimen.jpg",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos-crimen",
+          "format": "jpg",
+          "bytes": 63082
+        },
+        {
+          "fileName": "Sucesos-juicio.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788799007/prensa-abierta/contenido/Sucesos/Sucesos-juicio.jpg",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos-juicio",
+          "format": "jpg",
+          "bytes": 60898
+        },
+        {
+          "fileName": "Sucesos-justicia.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788799007/prensa-abierta/contenido/Sucesos/Sucesos-justicia.jpg",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos-justicia",
+          "format": "jpg",
+          "bytes": 341884
+        },
+        {
+          "fileName": "Sucesos-policia-2.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788799008/prensa-abierta/contenido/Sucesos/Sucesos-policia-2.jpg",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos-policia-2",
+          "format": "jpg",
+          "bytes": 96645
+        },
+        {
+          "fileName": "Sucesos-policia.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788799009/prensa-abierta/contenido/Sucesos/Sucesos-policia.jpg",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos-policia",
+          "format": "jpg",
+          "bytes": 115036
+        },
+        {
+          "fileName": "Sucesos-tribunales.jpg",
+          "url": "https://res.cloudinary.com/yobvezme/image/upload/v1788799009/prensa-abierta/contenido/Sucesos/Sucesos-tribunales.jpg",
+          "publicId": "prensa-abierta/contenido/Sucesos/Sucesos-tribunales",
+          "format": "jpg",
+          "bytes": 217449
+        }
+      ]
+    }
+  }
+}

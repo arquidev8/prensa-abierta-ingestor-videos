@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import cloudinaryManifest from '@/data/cloudinary-manifest.json';
 
 export interface CategoryVideoInfo {
   category: string;
@@ -7,6 +8,10 @@ export interface CategoryVideoInfo {
   fileName: string;
   filePath: string;
   streamUrl: string;
+  // true = `streamUrl` ya es una URL pública reproducible directamente (Cloudinary);
+  // false = `streamUrl` apunta a la ruta interna `/api/media/category-video` que
+  // transmite `filePath` desde disco. Ver `getAllCategoryFolders()`.
+  isRemote: boolean;
 }
 
 export interface MediaFile {
@@ -15,6 +20,28 @@ export interface MediaFile {
   streamUrl: string;
   size: number;
   extension: string;
+  isRemote: boolean;
+}
+
+// Manifiesto generado por `scripts/migrate-assets-to-cloudinary.mjs` (ver ese
+// archivo) al subir `assets/contenido` a Cloudinary. Se versiona en git como
+// cualquier otro archivo de código: es metadata liviana (nombres + URLs), no el
+// binario en sí. Mientras esté vacío (antes de correr la migración por primera
+// vez), `getAllCategoryFolders()` sigue leyendo del disco local como siempre.
+interface CloudinaryManifestAsset {
+  fileName: string;
+  url: string;
+  publicId: string;
+  format: string;
+  bytes: number;
+}
+interface CloudinaryManifestFolder {
+  videos: CloudinaryManifestAsset[];
+  images: CloudinaryManifestAsset[];
+}
+interface CloudinaryManifest {
+  generatedAt: string | null;
+  folders: Record<string, CloudinaryManifestFolder>;
 }
 
 export interface CategoryFolder {
@@ -43,6 +70,22 @@ export function getAssetsContenidoDir(): string {
   return path.resolve(process.cwd(), '../../assets/contenido');
 }
 
+// Resuelve la ruta absoluta a assets/uploads (archivos importados por el usuario
+// desde el "Editor de video" — ver /api/media/upload). Es hermana de
+// assets/contenido, en el mismo volumen `./assets` que comparten los contenedores
+// `web` y `engine` (docker-compose.yml), así que sobreviven a que se recreen los
+// contenedores y el Engine podría leerlos directo del disco si hiciera falta.
+//
+// A propósito NO se sirven desde `public/`: en el build "standalone" de Next.js
+// (usado en el Dockerfile) el servidor resuelve el set de archivos estáticos de
+// `public/` una sola vez al arrancar, así que un archivo escrito ahí en runtime
+// (después de que el proceso ya inició) nunca se vuelve servible — 404 permanente
+// hasta reconstruir la imagen. Por eso se sirven vía un route handler dinámico
+// (`/api/media/uploads/[filename]`), que sí lee el disco en cada request.
+export function getAssetsUploadsDir(): string {
+  return path.join(path.dirname(getAssetsContenidoDir()), 'uploads');
+}
+
 // Normaliza texto eliminando acentos y caracteres especiales para comparaciones
 export function normalizeCategoryString(str: string): string {
   if (!str) return '';
@@ -51,6 +94,39 @@ export function normalizeCategoryString(str: string): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .trim();
+}
+
+// Palabras vac\u00edas del espa\u00f1ol + verbos/muletillas t\u00edpicos de titular. Se usan para
+// quedarnos con las palabras "con contenido" de un titular y armar con ellas un
+// query de Pexels cuando la noticia no cae en ning\u00fan tema conocido del banco.
+const HEADLINE_STOPWORDS = new Set([
+  'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'al', 'a', 'y', 'o', 'u',
+  'e', 'en', 'con', 'sin', 'por', 'para', 'que', 'se', 'su', 'sus', 'este', 'esta', 'estos',
+  'estas', 'ese', 'esa', 'eso', 'como', 'mas', 'menos', 'pero', 'no', 'si', 'lo', 'le', 'les',
+  'ya', 'muy', 'tras', 'entre', 'desde', 'sobre', 'hasta', 'cuando', 'donde', 'segun', 'tambien',
+  'ante', 'cada', 'todo', 'toda', 'todos', 'todas', 'otro', 'otra', 'otros', 'otras', 'mismo',
+  'misma', 'dia', 'dias', 'ano', 'anos', 'hoy', 'ayer', 'manana', 'tarde', 'noche', 'ahora',
+  'puerto', 'rico', 'boricua', 'isla', 'pais',
+  'marca', 'marcaran', 'marcara', 'tendra', 'tendran', 'sera', 'seran', 'estara', 'estaran',
+  'dice', 'dijo', 'afirma', 'afirmo', 'asegura', 'aseguro', 'anuncia', 'anuncio', 'confirma',
+  'confirmo', 'reporta', 'reporte', 'informa', 'informo', 'preve', 'preven', 'espera', 'esperan',
+  'busca', 'buscan', 'pide', 'piden', 'exige', 'exigen',
+]);
+
+/**
+ * Reduce un titular a las ~5 palabras con m\u00e1s contenido para usarlas como query de
+ * imagen/video en Pexels. Es la \u00faltima red antes de la imagen destacada de la
+ * noticia cuando el titular no matchea ning\u00fan tema del banco.
+ * Ej: "Calor extremo y aguaceros marcar\u00e1n el tiempo este D\u00eda del Trabajo"
+ *   \u2192 "calor extremo aguaceros tiempo trabajo"
+ */
+export function headlineToPexelsQuery(headline?: string, max = 5): string {
+  return normalizeCategoryString(headline || '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 4 && !HEADLINE_STOPWORDS.has(w))
+    .slice(0, max)
+    .join(' ');
 }
 
 // Ruteo canónico categoría-de-noticia → carpeta de b-roll en `assets/contenido`.
@@ -192,26 +268,68 @@ const FOLDER_ROUTING: { folder: string; keywords: string[] }[] = [
 // Carpeta usada cuando ninguna regla de FOLDER_ROUTING matchea.
 const FALLBACK_FOLDER = 'Ahora';
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * ¿La keyword aparece en `haystack` (ya normalizado: minúsculas, sin acentos) como
+ * PALABRA, no como pedazo de otra? Antes se usaba `haystack.includes(kw)` a secas,
+ * que hacía que 'nba' matcheara dentro de "shei**nba**um" (→ una noticia de Claudia
+ * Sheinbaum caía en Deportes), 'nfl' dentro de "i**nfl**ación", 'iva' dentro de
+ * "act**iva**", etc.
+ *
+ * Reglas:
+ *  - Siempre debe empezar en un borde de palabra (inicio del texto o un caracter
+ *    que no sea letra/dígito: espacio, punto, guion…).
+ *  - Acrónimos/siglas cortas (≤4 chars, sin espacios: nba, nfl, ivu, otan, fema…)
+ *    exigen ADEMÁS terminar en un borde — deben ser la palabra completa.
+ *  - Stems más largos ('politic', 'deportiv', 'boxead'…) pueden llevar sufijo
+ *    ('política', 'deportivo', 'boxeador').
+ */
+function keywordInText(haystack: string, kw: string): boolean {
+  const k = kw.trim();
+  if (!k) return false;
+  const wholeWord = k.length <= 4 && !k.includes(' ');
+  const trailing = wholeWord ? '(?![a-z0-9])' : '';
+  return new RegExp(`(?<![a-z0-9])${escapeRegExp(k)}${trailing}`).test(haystack);
+}
+
 /**
  * Mapea una categoría de noticia (venga de la taxonomía que venga) + tags opcionales
- * a UNA de las carpetas canónicas de `assets/contenido`. Nunca devuelve vacío: si
- * nada matchea, devuelve `FALLBACK_FOLDER`.
+ * + el titular opcional a UNA de las carpetas canónicas de `assets/contenido`. Nunca
+ * devuelve vacío: si nada matchea, devuelve `FALLBACK_FOLDER`.
+ *
+ * El titular (`query`) participa en el paso 2 (keywords), NO en el paso 1 (nombre
+ * exacto de carpeta): si la categoría ya es una carpeta canónica ("Deportes"), esa
+ * categorización explícita manda y el titular no la puede overridear. Pero muchas
+ * categorías crudas del feed son genéricas ("General", "Nacional", "Investigación &
+ * Política"…) y no matchean ninguna carpeta ni keyword de categoría — antes, esas
+ * caían siempre a `Ahora` sin mirar el titular, aunque dijera claramente "concierto
+ * de Bad Bunny" o "el tribunal sentenció a…". Incluir el titular en el paso 2 deja
+ * que esas noticias genéricas igual encuentren la carpeta correcta por contenido.
  */
-export function resolveCategoryFolderName(categoryName?: string, tags?: string[]): string {
+export function resolveCategoryFolderName(categoryName?: string, tags?: string[], query?: string): string {
   const norm = normalizeCategoryString(categoryName || '');
-  const haystack = [norm, ...(tags || []).map((t) => normalizeCategoryString(t))]
+  const haystack = [
+    norm,
+    ...(tags || []).map((t) => normalizeCategoryString(t)),
+    normalizeCategoryString(query || ''),
+  ]
     .filter(Boolean)
     .join(' ');
 
-  // 1. Coincidencia directa con el nombre de una carpeta canónica.
+  // 1. Coincidencia directa con el nombre de una carpeta canónica (solo la categoría,
+  //    nunca el titular: una categorización explícita no debe ser overrideada por
+  //    una palabra suelta del titular).
   for (const { folder } of FOLDER_ROUTING) {
     if (norm === normalizeCategoryString(folder)) return folder;
   }
   if (norm === normalizeCategoryString(FALLBACK_FOLDER)) return FALLBACK_FOLDER;
 
-  // 2. Coincidencia por keyword, en orden de prioridad.
+  // 2. Coincidencia por keyword (categoría + tags + titular), en orden de prioridad.
   for (const { folder, keywords } of FOLDER_ROUTING) {
-    if (keywords.some((kw) => haystack.includes(kw))) return folder;
+    if (keywords.some((kw) => keywordInText(haystack, kw))) return folder;
   }
 
   // 3. Sin match → carpeta por defecto.
@@ -222,10 +340,11 @@ const VALID_VIDEO_EXTENSIONS = ['.mp4', '.mov', '.webm', '.mkv', '.avi'];
 const VALID_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp'];
 
 /**
- * Obtiene todas las categorías disponibles y sus medios (videos e imágenes) en
- * assets/contenido.
+ * Lee `assets/contenido` directamente del disco. Es el comportamiento
+ * histórico (pre-Cloudinary) y sigue siendo el fallback mientras el
+ * manifiesto de Cloudinary esté vacío (migración no corrida todavía).
  */
-export function getAllCategoryFolders(): CategoryFolder[] {
+function getLocalCategoryFolders(): CategoryFolder[] {
   const contenidoDir = getAssetsContenidoDir();
   if (!fs.existsSync(contenidoDir)) {
     return [];
@@ -251,6 +370,7 @@ export function getAllCategoryFolders(): CategoryFolder[] {
         )}&file=${encodeURIComponent(file)}`,
         size: stat.size,
         extension: path.extname(file).toLowerCase(),
+        isRemote: false,
       };
     };
 
@@ -270,6 +390,54 @@ export function getAllCategoryFolders(): CategoryFolder[] {
   }
 
   return folders;
+}
+
+/**
+ * Construye las categorías desde el manifiesto de Cloudinary (metadata
+ * generada por `scripts/migrate-assets-to-cloudinary.mjs`), sin tocar el
+ * disco. `streamUrl` ya es la URL pública de Cloudinary, reproducible
+ * directamente por el navegador o descargable por el Go Engine.
+ */
+function getCloudinaryCategoryFolders(): CategoryFolder[] {
+  const manifest = cloudinaryManifest as CloudinaryManifest;
+  const folderNames = Object.keys(manifest.folders || {});
+
+  return folderNames.map((name) => {
+    const folder = manifest.folders[name];
+    const toMediaFile = (asset: CloudinaryManifestAsset): MediaFile => ({
+      fileName: asset.fileName,
+      filePath: '',
+      streamUrl: asset.url,
+      size: asset.bytes,
+      extension: `.${asset.format}`.toLowerCase(),
+      isRemote: true,
+    });
+
+    const videoFiles = (folder.videos || []).map(toMediaFile);
+    const imageFiles = (folder.images || []).map(toMediaFile);
+
+    return {
+      name,
+      videoCount: videoFiles.length,
+      videos: videoFiles,
+      images: imageFiles,
+    };
+  });
+}
+
+/**
+ * Obtiene todas las categorías disponibles y sus medios (videos e imágenes).
+ * Prioriza el manifiesto de Cloudinary (`cloudinary-manifest.json`); si está
+ * vacío (todavía no se corrió la migración), cae al escaneo local de
+ * `assets/contenido` — así el proyecto sigue funcionando igual que antes
+ * hasta que se decida completar la migración.
+ */
+export function getAllCategoryFolders(): CategoryFolder[] {
+  const cloudinaryFolders = getCloudinaryCategoryFolders();
+  if (cloudinaryFolders.some((f) => f.videos.length > 0 || f.images.length > 0)) {
+    return cloudinaryFolders;
+  }
+  return getLocalCategoryFolders();
 }
 
 // Hash simple y estable (no criptográfico) para elegir un índice determinístico
@@ -309,6 +477,10 @@ interface TopicDef {
   fileTokens?: string[];
   keywords: string[];
   pexels: string;
+  // true = si no hay clip propio del tema, ir a Pexels (`pexels`) ANTES que al
+  // video genérico de la carpeta. Solo para temas cuya carpeta NO los representa
+  // bien (ej. "clima" cae en "Local", cuyos clips genéricos son de la ciudad).
+  preferPexelsVideo?: boolean;
 }
 
 const FOLDER_TOPICS: Record<string, TopicDef[]> = {
@@ -324,9 +496,10 @@ const FOLDER_TOPICS: Record<string, TopicDef[]> = {
         'sevilla fc', 'manchester united', 'manchester city', 'liverpool fc', 'chelsea fc',
         'bayern munich', 'juventus', 'inter de milan', 'ac milan', 'paris saint', ' psg',
         'boca juniors', 'river plate', 'club america', 'lionel messi', 'cristiano ronaldo',
-        'kylian mbappe', 'vinicius', 'neymar', 'seleccion de futbol', 'goleador', 'golazo',
-        'goleada', 'gol de', 'autogol', 'tiro penal', 'tiro libre', 'delantero', 'mediocampista',
-        'guardameta', 'arquero',
+        'kylian mbappe', 'mbappe', 'vinicius', 'neymar', 'haaland', 'lamine yamal', 'pele',
+        'maradona', 'seleccion de futbol', 'balon de oro', 'ballon d or', 'the best fifa',
+        'bota de oro', 'futbolista', 'goleador', 'golazo', 'goleada', 'gol de', 'autogol',
+        'tiro penal', 'tiro libre', 'delantero', 'mediocampista', 'guardameta', 'arquero',
       ],
       pexels: 'soccer football match stadium',
     },
@@ -539,6 +712,25 @@ const FOLDER_TOPICS: Record<string, TopicDef[]> = {
       ],
       pexels: 'government official press conference podium',
     },
+    {
+      // "El Tiempo" / clima cae en la carpeta "Local" (no hay carpeta propia), pero
+      // no hay b-roll de clima en el banco: este tema fuerza que imagen y video se
+      // traigan de Pexels con un query de clima en vez de agarrar una foto random
+      // de "Local" (que suelen ser de la gobernadora).
+      token: 'clima',
+      fileTokens: ['clima', 'tiempo', 'lluvia', 'huracan', 'tormenta', 'calor'],
+      preferPexelsVideo: true,
+      keywords: [
+        'el tiempo', 'clima', 'pronostico del tiempo', 'pronostico', 'meteorolog',
+        'servicio nacional de meteorologia', 'lluvia', 'lluvioso', 'aguacero', 'aguaceros',
+        'tronada', 'tormenta electrica', 'tormenta tropical', 'tormenta', 'huracan', 'ciclon',
+        'depresion tropical', 'onda tropical', 'vaguada', 'disturbio tropical', 'inundacion',
+        'inundaciones', 'marejada', 'oleaje', 'resaca', 'ola de calor', 'calor extremo',
+        'altas temperaturas', 'indice de calor', 'sofocante', 'sequia', 'polvo del sahara',
+        'frente frio', 'granizo',
+      ],
+      pexels: 'dramatic sky weather clouds storm rain sun',
+    },
   ],
 };
 
@@ -565,9 +757,9 @@ function detectTopic(folderName: string, text: string): TopicDef | null {
     FOLDER_TOPICS[folderName] ||
     FOLDER_TOPICS[Object.keys(FOLDER_TOPICS).find((k) => normalizeCategoryString(k) === normalizeCategoryString(folderName)) || ''];
   if (!topics) return null;
-  const padded = ` ${normalizeCategoryString(text)} `;
+  const haystack = normalizeCategoryString(text);
   for (const topic of topics) {
-    if (topic.keywords.some((kw) => padded.includes(kw))) return topic;
+    if (topic.keywords.some((kw) => keywordInText(haystack, kw))) return topic;
   }
   return null;
 }
@@ -594,16 +786,24 @@ export interface CompositionResolution {
   imagePexelsQuery?: string;
   // Paso 3 — VIDEO (segundo segmento): archivo de la MISMA carpeta.
   video: CategoryVideoInfo | null;
-  // Si la carpeta no tiene ningún video (raro): buscar un clip en Pexels.
+  // Query de Pexels para el video cuando: hay un tema identificado sin clip propio,
+  // o (sin tema) la carpeta no tiene ningún video.
   videoPexelsQuery?: string;
+  // Video GENÉRICO de la carpeta, usado SOLO como último recurso si `video` es null
+  // y Pexels (`videoPexelsQuery`) tampoco devuelve nada — evita que una noticia con
+  // tema pero sin clip propio se quede sin b-roll si Pexels no está configurado.
+  videoFallback?: CategoryVideoInfo | null;
 }
 
 /**
  * Resuelve la composición de b-roll para una noticia, siguiendo la ruta:
- *   1. categoría de la noticia → carpeta en `assets/contenido`.
- *   2. imagen referente en esa carpeta (tema) → si no hay, `imagePexelsQuery`.
+ *   1. categoría de la noticia (+ `query`/titular, si la categoría no matchea
+ *      ninguna carpeta/keyword por sí sola) → carpeta en `assets/contenido`.
+ *   2. imagen referente en esa carpeta (tema, detectado por `query`) → si no hay,
+ *      `imagePexelsQuery`.
  *   3. video de la MISMA carpeta acorde con la noticia (tema → genérico de la carpeta).
- * `query` (titular) determina el tema. Con `seed` (id de la noticia) la elección
+ * `query` (titular) determina tanto la carpeta (paso 1, como red de seguridad) como
+ * el tema dentro de ella (pasos 2-3). Con `seed` (id de la noticia) la elección
  * dentro de la carpeta es determinística (preview == descarga).
  */
 export function resolveComposition(
@@ -620,8 +820,8 @@ export function resolveComposition(
   const byName = (name: string) =>
     folders.find((f) => normalizeCategoryString(f.name) === normalizeCategoryString(name));
 
-  // Paso 1: categoría → carpeta.
-  const targetName = resolveCategoryFolderName(categoryName, tags);
+  // Paso 1: categoría (+ titular, si la categoría es genérica) → carpeta.
+  const targetName = resolveCategoryFolderName(categoryName, tags, query);
   const folder =
     (byName(targetName) && hasAssets(byName(targetName)!) ? byName(targetName) : undefined) ||
     (byName(FALLBACK_FOLDER) && hasAssets(byName(FALLBACK_FOLDER)!) ? byName(FALLBACK_FOLDER) : undefined) ||
@@ -635,39 +835,72 @@ export function resolveComposition(
     fileName: f.fileName,
     filePath: f.filePath,
     streamUrl: f.streamUrl,
+    isRemote: f.isRemote,
   });
 
   const haystack = [query || '', categoryName || '', ...(tags || [])].join(' ');
   const topic = detectTopic(folder.name, haystack);
-  const pexelsHint = topic ? topic.pexels : normalizeCategoryString(categoryName || folder.name);
+  // Query de Pexels para lo que NO esté en el banco:
+  //   - con tema → el query curado del tema (ej. "courtroom trial judge gavel").
+  //   - sin tema → las palabras con contenido del titular (mejor que el nombre de
+  //     la categoría, que suele ser genérico: "General", "Nacional", "El Tiempo").
+  const pexelsHint = topic
+    ? topic.pexels
+    : headlineToPexelsQuery(query) || normalizeCategoryString(categoryName || folder.name);
+
+  // Genérico de la carpeta (sin tema en el nombre): representa a la categoría en su
+  // conjunto. Se calcula siempre para tenerlo como red de seguridad.
+  const genericImgs = folder.images.filter(
+    (f) => tokensFromFilename(folder.name, f.fileName).length === 0
+  );
+  const genericVids = folder.videos.filter(
+    (f) => tokensFromFilename(folder.name, f.fileName).length === 0
+  );
 
   // Paso 2: IMAGEN referente en la carpeta.
-  //   - Con tema: solo imágenes de ESE tema (no de otro).
-  //   - Sin tema: cualquier imagen de la carpeta sirve como referente de la categoría.
+  //   - Con tema: SOLO imágenes de ESE tema (no de otro asunto).
+  //   - Sin tema: SOLO imágenes genéricas de la carpeta — nunca una imagen temática
+  //     de OTRO asunto (ej. la gobernadora para una noticia del tiempo que cayó en
+  //     "Local" por keyword). Si no hay imagen genérica → el caller va a Pexels.
   const imgFile = topic
     ? pickSeeded(folder.images.filter((f) => fileMatchesTopic(folder.name, f.fileName, topic)), seed)
-    : pickSeeded(folder.images, seed);
+    : pickSeeded(genericImgs, seed);
 
   // Paso 3: VIDEO acorde en la MISMA carpeta.
-  //   - Con tema: video de ese tema → si no hay, un genérico de la carpeta.
-  //   - Sin tema: un genérico de la carpeta.
-  let vidFile = topic
+  //   - Con tema y clip propio del tema → ese.
+  //   - Con tema SIN clip propio:
+  //       · tema `preferPexelsVideo` (ej. clima) → Pexels; genérico solo de red
+  //         de seguridad (`videoFallback`).
+  //       · resto → el genérico de la carpeta (que sí representa a la categoría).
+  //   - Sin tema → un genérico de la carpeta.
+  //
+  // `genericVid` sale SOLO de `genericVids` (clips sin tema en el nombre). Si la
+  // carpeta no tiene ninguno — ej. la Deportes de Cloudinary solo tiene clips por
+  // deporte (atletismo/baseball/basket/boxeo) — NO se usa uno temático al azar
+  // (basket para una nota de Mbappé); se deja `vidFile` vacío para que el caller
+  // vaya a Pexels con `videoPexelsQuery`.
+  const topicVid = topic
     ? pickSeeded(folder.videos.filter((f) => fileMatchesTopic(folder.name, f.fileName, topic)), seed)
     : undefined;
-  if (!vidFile) {
-    const generic = folder.videos.filter((f) => tokensFromFilename(folder.name, f.fileName).length === 0);
-    vidFile = pickSeeded(generic.length ? generic : folder.videos, seed);
-  }
+  const genericVid = pickSeeded(genericVids, seed);
+  const vidFile = topic
+    ? topicVid ?? (topic.preferPexelsVideo ? undefined : genericVid)
+    : genericVid;
+
+  // Último recurso (`videoFallback`): CUALQUIER video de la carpeta. Solo lo usa el
+  // caller si no hay video elegido y Pexels tampoco devolvió nada — un clip de
+  // deporte equivocado sigue siendo mejor que un video de color plano.
+  const anyVid = genericVid ?? pickSeeded(folder.videos, seed);
 
   return {
     matchedFolder: folder.name,
     matchedTopic: topic?.token,
     leadImage: imgFile ? toInfo(imgFile) : null,
-    // Pexels para la imagen SOLO si hay un tema identificado sin imagen propia
-    // (sin tema no hay "imagen referente" que buscar → el caller usa la destacada).
-    imagePexelsQuery: !imgFile && topic ? pexelsHint : undefined,
+    // Pexels para la imagen siempre que el banco no tenga una relevante.
+    imagePexelsQuery: imgFile ? undefined : pexelsHint,
     video: vidFile ? toInfo(vidFile) : null,
     videoPexelsQuery: vidFile ? undefined : pexelsHint,
+    videoFallback: !vidFile && anyVid ? toInfo(anyVid) : null,
   };
 }
 

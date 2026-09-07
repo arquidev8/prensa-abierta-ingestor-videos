@@ -67,7 +67,7 @@ export async function requestVideoRender(payload: {
   duration_sec?: number;
   // Plantilla de composición: 'reels-safe' sube el bloque de titular a la safe zone
   // del grid 1:1 y separa más el logo. '' / 'standard' = layout por defecto.
-  template?: 'standard' | 'reels-safe';
+  template?: 'standard' | 'reels-safe' | 'app-promo';
 }): Promise<{ job_id: string; job: VideoJob }> {
   const res = await fetch(`${ENGINE_URL}/api/video/render`, {
     method: 'POST',

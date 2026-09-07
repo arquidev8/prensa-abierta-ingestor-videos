@@ -74,8 +74,12 @@ type VideoRenderRequest struct {
 	HeadlineStyle string   `json:"headline_style"` // "lower_third", "banner", "center"
 	// Template de composición: "" / "standard" = layout por defecto; "reels-safe" =
 	// plantilla optimizada para Instagram Reels (bloque de titular elevado a la safe
-	// zone del grid 1:1, logo más separado del borde, interlineado compacto).
-	// Ver .agents/formato-video-reel.md.
+	// zone del grid 1:1, logo más separado del borde, interlineado compacto); "app-promo" =
+	// igual a "standard" pero con el bloque de rótulo+titular subido y el banner
+	// "Descarga la App GRATIS" (assets/logos/descargar-app-gratis.jpg) quemado a
+	// 16px justo debajo de la última línea del titular (posición dinámica, ver
+	// computePromoY() en pkg/video/engine.go — varía según cuántas líneas ocupe).
+	// Ver .agents/formato-video-reel.md y layoutFor() en pkg/video/engine.go.
 	Template string `json:"template"`
 }
 

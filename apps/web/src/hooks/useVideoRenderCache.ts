@@ -17,7 +17,7 @@ export interface RenderParams {
   imageUrl?: string;
   // Base de la composición elegida en el "Editor de video".
   background: 'image' | 'video';
-  template: 'standard' | 'reels-safe';
+  template: 'standard' | 'reels-safe' | 'app-promo';
   // Archivos importados por el usuario (ya subidos a /api/media/upload).
   customImageUrl?: string;
   customClipUrl?: string;
@@ -67,6 +67,10 @@ export function useVideoRenderCache() {
 
     (async () => {
       try {
+        // Timeout defensivo del lado del cliente: el servidor ya acota su propia
+        // espera (~120s) al pollear el job del Go Engine; este límite le da 10s de
+        // margen para que ese timeout/resultado llegue a tiempo antes de abortar
+        // el fetch, en vez de cortar la conexión primero.
         const res = await fetch('/api/render-video', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -81,7 +85,7 @@ export function useVideoRenderCache() {
             customClipUrl: params.customClipUrl,
             duration: params.duration || 10,
           }),
-          signal: AbortSignal.timeout(60_000),
+          signal: AbortSignal.timeout(130_000),
         });
         const data = await res.json();
         if (res.ok && data.success && data.videoUrl) {

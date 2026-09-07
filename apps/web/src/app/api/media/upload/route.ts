@@ -2,12 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
-
-// Destino de los archivos importados desde el "Editor de video" (imagen/video
-// propios). Viven en /public para que tanto el navegador (preview) como el
-// Go Engine (vía WEB_INTERNAL_URL, ver /api/render-video) puedan alcanzarlos
-// por HTTP.
-const UPLOAD_DIR = path.join(process.cwd(), 'public', 'uploads');
+import { getAssetsUploadsDir } from '@/lib/contentLibrary';
 
 const ALLOWED_TYPES: Record<'image' | 'video', { mime: string[]; ext: string }> = {
   image: { mime: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'], ext: '.jpg' },
@@ -44,11 +39,15 @@ export async function POST(req: NextRequest) {
     const safeExt = /^\.[a-z0-9]{2,5}$/.test(extFromName) ? extFromName : allowed.ext;
     const fileName = `${crypto.randomUUID()}${safeExt}`;
 
-    await mkdir(UPLOAD_DIR, { recursive: true });
+    // Se guarda en assets/uploads (NO en public/): ver el comentario en
+    // getAssetsUploadsDir() — public/ no sirve archivos escritos en runtime
+    // dentro del build "standalone" de Next.js (404 permanente).
+    const uploadDir = getAssetsUploadsDir();
+    await mkdir(uploadDir, { recursive: true });
     const buffer = Buffer.from(await file.arrayBuffer());
-    await writeFile(path.join(UPLOAD_DIR, fileName), buffer);
+    await writeFile(path.join(uploadDir, fileName), buffer);
 
-    return NextResponse.json({ success: true, url: `/uploads/${fileName}` });
+    return NextResponse.json({ success: true, url: `/api/media/uploads/${fileName}` });
   } catch (error: any) {
     console.error('Error subiendo archivo del Editor de video:', error);
     return NextResponse.json({ error: error?.message || 'No se pudo subir el archivo' }, { status: 500 });

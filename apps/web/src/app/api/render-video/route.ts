@@ -12,7 +12,10 @@ import { requestVideoRender, checkVideoJob } from '@/lib/engine';
 // casi nunca coincidían. Se eliminó esa duplicación: este endpoint ahora solo resuelve
 // el clip (con el mismo `seed` que usa el preview) y delega el render real al Engine.
 
-const MAX_WAIT_MS = 50_000;
+// 120s: el Go Engine acota cada render individual a 2 min (defaultRenderTimeout en
+// pkg/video/engine.go), así que este polling debe cubrir esa misma ventana para no
+// devolver un 504 justo antes de que el worker termine.
+const MAX_WAIT_MS = 120_000;
 const POLL_INTERVAL_MS = 1_500;
 
 // El clip que se pasa como `clip_urls` al Go Engine lo descarga el CONTENEDOR del
@@ -50,11 +53,14 @@ export async function POST(req: NextRequest) {
       // 'image' => composición liderada por la imagen inicial, sin clip de b-roll
       // (elegido desde el "Editor de video" del modal). 'video' / undefined => flujo normal.
       background?: 'image' | 'video';
-      // Plantilla de layout: 'reels-safe' aplica la guía .agents/formato-video-reel.md.
-      template?: 'standard' | 'reels-safe';
+      // Plantilla de layout: 'reels-safe' aplica la guía .agents/formato-video-reel.md;
+      // 'app-promo' es igual a 'standard' pero con el banner "Descarga la App GRATIS"
+      // quemado debajo del titular (ver layoutFor() en el Go Engine).
+      template?: 'standard' | 'reels-safe' | 'app-promo';
       // Archivos importados por el usuario en el "Editor de video" (ya subidos vía
-      // /api/media/upload, rutas same-origin tipo /uploads/<archivo>). Cuando están
-      // presentes, reemplazan la imagen/video que se resolvería automáticamente.
+      // /api/media/upload, rutas same-origin tipo /api/media/uploads/<archivo>).
+      // Cuando están presentes, reemplazan la imagen/video que se resolvería
+      // automáticamente.
       customImageUrl?: string;
       customClipUrl?: string;
     };
@@ -65,7 +71,11 @@ export async function POST(req: NextRequest) {
 
     const effectiveNewsId = newsId || `news_${Date.now()}`;
     const origin = WEB_INTERNAL_URL || req.nextUrl.origin;
-    const abs = (streamUrl: string) => `${origin}${streamUrl}`;
+    // `streamUrl` ya es absoluta cuando el clip viene de Cloudinary (banco
+    // migrado) — en ese caso el Go Engine la descarga directo del CDN, sin
+    // pasar por `web`. Solo las rutas locales (`/api/media/...`) necesitan el
+    // prefijo de origen interno.
+    const abs = (streamUrl: string) => (/^https?:\/\//i.test(streamUrl) ? streamUrl : `${origin}${streamUrl}`);
 
     // Composición de b-roll siguiendo la ruta:
     //   1. categoría → carpeta en assets/contenido
@@ -92,7 +102,9 @@ export async function POST(req: NextRequest) {
       : comp.leadImage
         ? `banco (${comp.leadImage.fileName})`
         : '';
-    if (!leadImageUrl && comp.imagePexelsQuery) {
+
+    const tryPexelsPhoto = async () => {
+      if (leadImageUrl || !comp.imagePexelsQuery) return;
       try {
         const pics = await searchPexelsPhotos(comp.imagePexelsQuery);
         if (pics.length > 0) {
@@ -102,10 +114,23 @@ export async function POST(req: NextRequest) {
       } catch (e) {
         console.warn('[render-video] Búsqueda de foto en Pexels falló:', e);
       }
-    }
-    if (!leadImageUrl && imageUrl) {
-      leadImageUrl = imageUrl;
-      leadImageSource = 'destacada de la noticia';
+    };
+
+    // Con un tema identificado, la foto de Pexels del tema va ANTES que la imagen
+    // destacada de la noticia: esa foto (un vocero, un edificio, la gobernadora…)
+    // casi siempre es de otro asunto y no del tema real del titular. Y si Pexels
+    // tampoco tiene nada, se prefiere NO poner imagen líder (el video temático
+    // ocupa toda la pieza) antes que meter una foto de otro asunto.
+    if (comp.matchedTopic) {
+      await tryPexelsPhoto();
+    } else {
+      // Sin tema: la foto propia de la noticia es el mejor candidato; si no hay,
+      // Pexels con las palabras del titular.
+      if (imageUrl) {
+        leadImageUrl = imageUrl;
+        leadImageSource = 'destacada de la noticia';
+      }
+      await tryPexelsPhoto();
     }
 
     // ── Paso 3: VIDEO de la misma carpeta ──────────────────────────────────
@@ -134,6 +159,12 @@ export async function POST(req: NextRequest) {
         console.warn('[render-video] Búsqueda de video en Pexels falló:', e);
       }
     }
+    // Último recurso: el video genérico de la carpeta (si Pexels no devolvió nada
+    // para un tema sin clip propio — ej. Pexels no configurado).
+    if (!imageOnly && !videoClipUrl && comp.videoFallback) {
+      videoClipUrl = abs(comp.videoFallback.streamUrl);
+      videoSource = `banco genérico (${comp.videoFallback.fileName})`;
+    }
 
     const clipUrls: string[] = videoClipUrl ? [videoClipUrl] : [];
 
@@ -156,7 +187,8 @@ export async function POST(req: NextRequest) {
       // clip_urls viene vacío.
       no_category_fallback: !!comp.matchedTopic || imageOnly,
       duration_sec: duration || 12,
-      template: template === 'reels-safe' ? 'reels-safe' : 'standard',
+      template:
+        template === 'reels-safe' ? 'reels-safe' : template === 'app-promo' ? 'app-promo' : 'standard',
     });
 
     // El Engine renderiza de forma asíncrona (worker pool); hacemos polling acotado
