@@ -71,7 +71,11 @@ export async function POST(req: NextRequest) {
 
     const effectiveNewsId = newsId || `news_${Date.now()}`;
     const origin = WEB_INTERNAL_URL || req.nextUrl.origin;
-    const abs = (streamUrl: string) => `${origin}${streamUrl}`;
+    // `streamUrl` ya es absoluta cuando el clip viene de Cloudinary (banco
+    // migrado) — en ese caso el Go Engine la descarga directo del CDN, sin
+    // pasar por `web`. Solo las rutas locales (`/api/media/...`) necesitan el
+    // prefijo de origen interno.
+    const abs = (streamUrl: string) => (/^https?:\/\//i.test(streamUrl) ? streamUrl : `${origin}${streamUrl}`);
 
     // Composición de b-roll siguiendo la ruta:
     //   1. categoría → carpeta en assets/contenido
@@ -98,7 +102,9 @@ export async function POST(req: NextRequest) {
       : comp.leadImage
         ? `banco (${comp.leadImage.fileName})`
         : '';
-    if (!leadImageUrl && comp.imagePexelsQuery) {
+
+    const tryPexelsPhoto = async () => {
+      if (leadImageUrl || !comp.imagePexelsQuery) return;
       try {
         const pics = await searchPexelsPhotos(comp.imagePexelsQuery);
         if (pics.length > 0) {
@@ -108,10 +114,23 @@ export async function POST(req: NextRequest) {
       } catch (e) {
         console.warn('[render-video] Búsqueda de foto en Pexels falló:', e);
       }
-    }
-    if (!leadImageUrl && imageUrl) {
-      leadImageUrl = imageUrl;
-      leadImageSource = 'destacada de la noticia';
+    };
+
+    // Con un tema identificado, la foto de Pexels del tema va ANTES que la imagen
+    // destacada de la noticia: esa foto (un vocero, un edificio, la gobernadora…)
+    // casi siempre es de otro asunto y no del tema real del titular. Y si Pexels
+    // tampoco tiene nada, se prefiere NO poner imagen líder (el video temático
+    // ocupa toda la pieza) antes que meter una foto de otro asunto.
+    if (comp.matchedTopic) {
+      await tryPexelsPhoto();
+    } else {
+      // Sin tema: la foto propia de la noticia es el mejor candidato; si no hay,
+      // Pexels con las palabras del titular.
+      if (imageUrl) {
+        leadImageUrl = imageUrl;
+        leadImageSource = 'destacada de la noticia';
+      }
+      await tryPexelsPhoto();
     }
 
     // ── Paso 3: VIDEO de la misma carpeta ──────────────────────────────────
@@ -139,6 +158,12 @@ export async function POST(req: NextRequest) {
       } catch (e) {
         console.warn('[render-video] Búsqueda de video en Pexels falló:', e);
       }
+    }
+    // Último recurso: el video genérico de la carpeta (si Pexels no devolvió nada
+    // para un tema sin clip propio — ej. Pexels no configurado).
+    if (!imageOnly && !videoClipUrl && comp.videoFallback) {
+      videoClipUrl = abs(comp.videoFallback.streamUrl);
+      videoSource = `banco genérico (${comp.videoFallback.fileName})`;
     }
 
     const clipUrls: string[] = videoClipUrl ? [videoClipUrl] : [];

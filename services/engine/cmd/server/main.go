@@ -52,7 +52,12 @@ func main() {
 		}
 	}
 
-	videoEngine := video.NewEngine(os.Getenv("FFMPEG_PATH"), assetsDir, outputVideosDir, videoWorkers)
+	// URLs opcionales del logo/banner en Cloudinary (banco de medios migrado);
+	// vacías = se sigue usando el archivo local bajo assetsDir/logos como antes.
+	logoURL := os.Getenv("LOGO_URL")
+	promoImageURL := os.Getenv("PROMO_IMAGE_URL")
+
+	videoEngine := video.NewEngine(os.Getenv("FFMPEG_PATH"), assetsDir, outputVideosDir, videoWorkers, logoURL, promoImageURL)
 	if err := videoEngine.CheckFFmpegAvailability(); err != nil {
 		log.Printf("[Warning] FFmpeg check: %v (los renders usarán generador interno o fallback)", err)
 	} else {

@@ -44,7 +44,15 @@ type Engine struct {
 // NewEngine creates a new FFmpeg video rendering engine.
 // workerCount define el tamaño del worker pool que limita cuántos renders
 // de FFmpeg corren en paralelo; si es <= 0 se usa un valor por defecto de 2.
-func NewEngine(ffmpegPath, assetsDir, outputDir string, workerCount int) *Engine {
+//
+// logoURL/promoImageURL son opcionales: si vienen configurados (banco de
+// logos migrado a Cloudinary, ver .doc/context.md), el logo/banner se
+// descarga UNA VEZ al arrancar y se cachea en la misma ruta local que ya
+// usa el resto del código (`defaultLogo`/`promoImage`), sin cambiar nada
+// más del pipeline de render. Si la descarga falla o las URLs están
+// vacías, se usa el archivo local existente bajo `assetsDir/logos` (mismo
+// comportamiento que antes de Cloudinary).
+func NewEngine(ffmpegPath, assetsDir, outputDir string, workerCount int, logoURL, promoImageURL string) *Engine {
 	if ffmpegPath == "" {
 		ffmpegPath = os.Getenv("FFMPEG_PATH")
 		if ffmpegPath == "" {
@@ -57,6 +65,9 @@ func NewEngine(ffmpegPath, assetsDir, outputDir string, workerCount int) *Engine
 
 	logoPath := filepath.Join(assetsDir, "logos", "prensa_abierta_logo.png")
 	promoPath := filepath.Join(assetsDir, "logos", "descargar-app-gratis.jpg")
+
+	downloadAssetIfConfigured(logoURL, logoPath)
+	downloadAssetIfConfigured(promoImageURL, promoPath)
 
 	if workerCount <= 0 {
 		workerCount = 2
@@ -344,19 +355,32 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	return nil
 }
 
-// kenBurnsFilter devuelve la cadena de filtros para hacer zoom-in lento (~10% a lo
-// largo de `dur` segundos) sobre una imagen fija: lienzo 1.5x (1620x2880) →
-// `scale:eval=frame` (re-evalúa el factor cada frame según `t`, tope min(t/dur,1))
-// → `crop` central a 1080x1920. NO se usa `zoompan`, que combinado con `-loop 1`
-// dispara muchísimos más frames de los pedidos (bug observado: +1 min de salida
-// para un pedido de 6s).
-func kenBurnsFilter(dur int) string {
+// coverImageFilter encuadra CUALQUIER imagen (retrato, apaisada o cuadrada) en el
+// lienzo vertical 1080x1920 SIN recortar al sujeto: la imagen completa se ajusta
+// centrada (`force_original_aspect_ratio=decrease`) y el espacio sobrante se rellena
+// con una copia ampliada y desenfocada de la misma imagen (estilo Reels/TikTok).
+//
+// Antes se hacía un `crop` central del lienzo lleno (`...=increase,crop`), que
+// cortaba a cualquier sujeto descentrado — p. ej. una foto de agencia donde la
+// persona aparece a un lado (caso reportado: Mbappé quedaba cortado).
+//
+// Se le suma un zoom lento (~6%) para dar algo de movimiento; NO se usa `zoompan`,
+// que combinado con `-loop 1` dispara muchísimos más frames de los pedidos.
+//
+// El string NO lleva prefijo `[0:v]` ni etiqueta final: quien lo use debe
+// anteponer la etiqueta de entrada y encadenar (`,drawtext…`) o etiquetar la
+// salida según su contexto (`-vf`, `-filter_complex`, dentro de buildRenderArgs).
+func coverImageFilter(dur int) string {
 	if dur < 1 {
 		dur = 1
 	}
 	return fmt.Sprintf(
-		"scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,"+
-			"scale=w='1080*(1+0.10*min(t/%d,1))':h='1920*(1+0.10*min(t/%d,1))':eval=frame,"+
+		"split=2[cf_bg][cf_fg];"+
+			"[cf_bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"+
+			"boxblur=luma_radius=20:luma_power=2,eq=brightness=-0.12:saturation=0.85[cf_bgb];"+
+			"[cf_fg]scale=1080:1920:force_original_aspect_ratio=decrease[cf_fgf];"+
+			"[cf_bgb][cf_fgf]overlay=(W-w)/2:(H-h)/2,"+
+			"scale=w='1080*(1+0.06*min(t/%d,1))':h='1920*(1+0.06*min(t/%d,1))':eval=frame,"+
 			"crop=1080:1920,setsar=1",
 		dur, dur,
 	)
@@ -379,7 +403,9 @@ func (e *Engine) prepareImageSegment(ctx context.Context, tempDir, imageURL stri
 		"-y",
 		"-loop", "1", "-t", fmt.Sprintf("%.2f", sec),
 		"-i", localImg,
-		"-vf", kenBurnsFilter(secInt) + ",fps=30,format=yuv420p",
+		// -filter_complex (no -vf) porque coverImageFilter usa split/overlay.
+		"-filter_complex", "[0:v]" + coverImageFilter(secInt) + ",fps=30,format=yuv420p[cf_out]",
+		"-map", "[cf_out]",
 		"-c:v", "libx264", "-preset", "ultrafast",
 		"-pix_fmt", "yuv420p",
 		"-an",
@@ -418,7 +444,7 @@ func (e *Engine) renderImageZoomVideo(ctx context.Context, job *models.VideoJob,
 	lo.promoY = computePromoY(lo, cleanHeadline, headlineFontSize)
 
 	videoFilter := strings.Join([]string{
-		kenBurnsFilter(duration),
+		coverImageFilter(duration),
 		fmt.Sprintf("drawbox=y=%s:color=black@0.85:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
 		categoryHeaderFilters(req.Category, lo),
 		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=%s:line_spacing=%d:fix_bounds=true", cleanHeadline, lo.headY, lo.headLineSpacing),
@@ -473,6 +499,55 @@ func (e *Engine) downloadToTempFile(ctx context.Context, url string) (string, er
 	}
 
 	return tmpFile.Name(), nil
+}
+
+// downloadAssetIfConfigured descarga `url` a `dest` (sobreescribiendo lo que
+// haya) si `url` no está vacía. Se usa solo en el arranque, para cachear
+// localmente el logo/banner cuando el banco de medios vive en Cloudinary —
+// así el overlay de FFmpeg sigue usando una ruta de archivo local (más
+// simple y rápido que pasarle una URL remota por render). Si falla, se
+// registra un warning y se deja el archivo local existente tal cual (si lo
+// hay), sin interrumpir el arranque del servidor.
+func downloadAssetIfConfigured(url, dest string) {
+	if url == "" {
+		return
+	}
+	if err := downloadFileTo(url, dest); err != nil {
+		log.Printf("[VideoEngine] no se pudo descargar %s: %v (se usará el archivo local existente en %s, si lo hay)", url, err, dest)
+	} else {
+		log.Printf("[VideoEngine] asset descargado desde Cloudinary → %s", dest)
+	}
+}
+
+func downloadFileTo(url, dest string) error {
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("status HTTP %d al descargar %s", resp.StatusCode, url)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		return err
+	}
+
+	tmp := dest + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	f.Close()
+
+	return os.Rename(tmp, dest)
 }
 
 // renderFallbackColorVideo es el último recurso cuando no hay ni clip de video ni
