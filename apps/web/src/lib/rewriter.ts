@@ -1,6 +1,9 @@
 import { sanitizeBrandVoice } from './sanitizer';
+import { fallbackVideoDirection, VideoDirection } from './videoDirection';
 
 export interface AutonomousArticle {
+  /** Siempre `autonomous`: lo redactó este motor local, no la IA remota. */
+  source: 'autonomous';
   title: string;
   subtitle: string;
   content_html: string;
@@ -8,6 +11,7 @@ export interface AutonomousArticle {
   tags: string[];
   video_search_tags: string[];
   suggested_image_concept: string;
+  video_direction: VideoDirection;
 }
 
 /**
@@ -25,27 +29,39 @@ export function generateAutonomousEditorial(
   const cleanRaw = (rawContent || '').replace(/<[^>]*>?/gm, ' ').replace(/\s+/g, ' ').trim();
   const cleanTitle = (rawTitle || '').trim();
 
-  // Detección de categoría inteligente
-  const lower = `${cleanTitle} ${cleanRaw}`.toLowerCase();
+  // Detección de categoría inteligente. Se normaliza (sin acentos) para que
+  // "béisbol"/"política"/"huracán" matcheen con o sin tilde.
+  const lower = `${cleanTitle} ${cleanRaw}`
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
+  const has = (...terms: string[]) => terms.some((t) => lower.includes(t));
   let category = 'Noticias';
   let videoTags = ['puerto rico news', 'ultimas noticias'];
 
-  if (lower.includes('concierto') || lower.includes('bad bunny') || lower.includes('bithorn') || lower.includes('música') || lower.includes('artista')) {
+  if (has('concierto', 'bad bunny', 'bithorn', 'musica', 'artista', 'cantante', 'farandula')) {
     category = 'Farándula';
     videoTags = ['concert stadium', 'crowd celebration', 'puerto rico night'];
-  } else if (lower.includes('policía') || lower.includes('arresto') || lower.includes('tribunal') || lower.includes('jurado') || lower.includes('carjacking') || lower.includes('fiscalía') || lower.includes('asesinato')) {
+  } else if (has('policia', 'arresto', 'tribunal', 'jurado', 'carjacking', 'fiscalia', 'asesinato', 'tiroteo', 'balacera')) {
     category = 'Tribunales';
     videoTags = ['courtroom gavel', 'police flashing lights', 'investigation'];
-  } else if (lower.includes('calor') || lower.includes('temperatura') || lower.includes('lluvia') || lower.includes('tormenta') || lower.includes('nws') || lower.includes('onda tropical') || lower.includes('huracán')) {
+  } else if (has('calor', 'temperatura', 'lluvia', 'tormenta', 'nws', 'onda tropical', 'huracan', 'meteorolog')) {
     category = 'El Tiempo';
     videoTags = ['sun rays tropical', 'weather radar', 'puerto rico coast'];
-  } else if (lower.includes('gobernador') || lower.includes('pnp') || lower.includes('ppd') || lower.includes('senado') || lower.includes('elecciones') || lower.includes('alcalde')) {
+  } else if (has('gobernador', 'pnp', 'ppd', 'senado', 'elecciones', 'alcalde', 'legislatura')) {
     category = 'Política';
     videoTags = ['capitol dome', 'press conference', 'government podium'];
-  } else if (lower.includes('baseball') || lower.includes('mlb') || lower.includes('mets') || lower.includes('boxeo') || lower.includes('deporte')) {
+  } else if (
+    has(
+      'baseball', 'beisbol', 'mlb', 'mets', 'yankees', 'dodgers', 'grandes ligas',
+      'serie mundial', 'lanzador', 'pitcheo', 'pitcher', 'jonron', 'cuadrangular',
+      'bateador', 'spring training', 'boxeo', 'baloncesto', 'bsn', 'nba', 'nfl',
+      'futbol', 'deporte', 'atleta', 'campeonato'
+    )
+  ) {
     category = 'Deportes';
     videoTags = ['baseball stadium', 'sports action', 'athlete victory'];
-  } else if (lower.includes('agua') || lower.includes('luma') || lower.includes('aaa') || lower.includes('energía') || lower.includes('banco')) {
+  } else if (has('agua', 'luma', 'aaa', 'energia', 'banco', 'economia', 'presupuesto', 'impuesto')) {
     category = 'Economía';
     videoTags = ['city traffic', 'power grid lines', 'business office'];
   }
@@ -80,13 +96,21 @@ export function generateAutonomousEditorial(
 
   const finalHtml = `${paragraph1}${paragraph2}${paragraph3}${paragraph4}`;
 
+  const suggestedImageConcept = `Cobertura especial de ${category.toLowerCase()} en Puerto Rico`;
+
   return {
+    source: 'autonomous',
     title: newTitle,
     subtitle: subtitle,
     content_html: finalHtml,
     category: category,
     tags: ['Puerto Rico', category, 'Última Hora', 'Prensa Abierta'],
     video_search_tags: videoTags,
-    suggested_image_concept: `Cobertura especial de ${category.toLowerCase()} en Puerto Rico`,
+    suggested_image_concept: suggestedImageConcept,
+    video_direction: fallbackVideoDirection({
+      fallbackHeadline: newTitle,
+      category,
+      videoSearchTags: videoTags,
+    }),
   };
 }

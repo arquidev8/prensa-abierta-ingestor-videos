@@ -1,8 +1,11 @@
 import { sanitizeBrandVoice } from './sanitizer';
 import { generateAutonomousEditorial } from './rewriter';
 import { sanitizeVideoSearchTags } from './pexels';
+import { sanitizeVideoDirection, VideoDirection } from './videoDirection';
 
 export interface EditorialRewriteResult {
+  /** `ai` = lo redactó el modelo remoto; `autonomous` = el Motor Autónomo local. */
+  source: 'ai' | 'autonomous';
   title: string;
   subtitle: string;
   content_html: string;
@@ -10,12 +13,82 @@ export interface EditorialRewriteResult {
   tags: string[];
   video_search_tags: string[];
   suggested_image_concept: string;
+  /** Decisiones de composición del Reel 9:16 (Capa 1: se genera y sanea aquí). */
+  video_direction: VideoDirection;
 }
 
 export interface OllamaConfig {
   baseUrl?: string;
   apiKey?: string;
   model?: string;
+}
+
+// ── Serialización + reintentos de la API de IA ────────────────────────────────
+// El plan de Ollama Cloud tiene un límite de concurrencia bajo: varias redacciones
+// en paralelo (autopilot, o el usuario procesando en ráfaga) disparan
+// `429 "too many concurrent requests"` y hoy eso cae directo al Motor Autónomo.
+// Se encadenan de a una, con una pausa corta entre llamadas, y se reintenta con
+// backoff ante 429/503 antes de rendirse.
+let aiCallChain: Promise<unknown> = Promise.resolve();
+const AI_CALL_SPACING_MS = 600;
+
+function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+  const result = aiCallChain.then(fn, fn);
+  aiCallChain = result
+    .catch(() => {})
+    .then(() => new Promise((r) => setTimeout(r, AI_CALL_SPACING_MS)));
+  return result;
+}
+
+async function fetchIaWithRetry(
+  endpoint: string,
+  init: RequestInit,
+  maxAttempts = 3,
+  timeoutMs = 60_000
+): Promise<Response> {
+  let lastRes: Response | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Timeout por intento: una redacción larga tarda 15-25s; si a los 60s no
+    // respondió, se aborta y se cae al Motor Autónomo en vez de colgar el pipeline.
+    const res = await fetch(endpoint, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    if (res.status !== 429 && res.status !== 503) return res;
+    lastRes = res;
+    if (attempt < maxAttempts) {
+      const backoff = 800 * 2 ** (attempt - 1); // 0.8s, 1.6s
+      console.warn(
+        `[IA Client] ${res.status} de la API IA; reintento ${attempt}/${maxAttempts - 1} en ${backoff}ms`
+      );
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
+  return lastRes as Response;
+}
+
+/**
+ * `JSON.parse` tolerante con la salida de los modelos: quita el bloque de código
+ * markdown (```json … ```), texto antes/después del objeto y comas colgantes.
+ * GLM-5.2 en Ollama envuelve el JSON en un fence pese a `response_format`.
+ */
+function parseModelJson(raw: string): any {
+  let s = (raw || '').trim();
+
+  // ```json … ```  |  ``` … ```
+  const fenced = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced) s = fenced[1].trim();
+
+  // Recorta cualquier texto suelto fuera del objeto principal.
+  if (!s.startsWith('{')) {
+    const first = s.indexOf('{');
+    const last = s.lastIndexOf('}');
+    if (first !== -1 && last > first) s = s.slice(first, last + 1);
+  }
+
+  try {
+    return JSON.parse(s);
+  } catch {
+    // Último intento: quita comas colgantes antes de } o ].
+    return JSON.parse(s.replace(/,\s*([}\]])/g, '$1'));
+  }
 }
 
 export async function rewriteNewsWithOllamaCloud(
@@ -27,22 +100,23 @@ export async function rewriteNewsWithOllamaCloud(
   const baseUrl =
     config?.baseUrl ||
     process.env.OLLAMA_CLOUD_BASE_URL ||
-    'https://api.siliconflow.cn/v1'; // Compatible con Ollama Cloud / SiliconFlow / OpenAI
+    'https://ollama.com/v1'; // Compatible con Ollama Cloud / SiliconFlow / OpenAI
 
   const apiKey =
     config?.apiKey ||
-    process.env.OLLAMA_CLOUD_API_KEY ||
-    'c9885517759f4cce8642c322a5dd1c88.t2y6QnLerXa-kK-BcuvAUYFu';
+    process.env.OLLAMA_CLOUD_API_KEY; 
 
-  let model = config?.model || process.env.OLLAMA_MODEL || 'THUDM/glm-4-9b-chat';
+  let model = config?.model || process.env.OLLAMA_MODEL || 'glm-5.2';
 
-  // Normalización de nombres de modelos para SiliconFlow / Ollama Cloud
-  if (model === 'glm-5.2' || model === 'glm-4' || model === 'glm') {
-    model = 'THUDM/glm-4-9b-chat';
-  } else if (model === 'minimax-m3' || model === 'minimax') {
-    model = 'minimax/MiniMax-Text-01';
-  } else if (model.includes('qwen') && !model.includes('/')) {
-    model = 'Qwen/Qwen2.5-72B-Instruct';
+  // Alias heredados → tags reales de Ollama Cloud (https://ollama.com/search?c=cloud).
+  // Los valores que ya manda la UI ('glm-5.2', 'minimax-m3', 'qwen2.5:72b') son tags
+  // válidos de Ollama Cloud y pasan sin tocar; acá solo se mapean nombres viejos/cortos.
+  if (model === 'glm-4' || model === 'glm') {
+    model = 'glm-5.2';
+  } else if (model === 'minimax') {
+    model = 'minimax-m3';
+  } else if (model === 'qwen' || model === 'qwen2.5:72b' || (model.toLowerCase().includes('qwen') && model.includes('/'))) {
+    model = 'qwen3.5:397b';
   }
 
   const systemPrompt = `Eres el Editor en Jefe de Prensa Abierta (prensaabierta.pr), medio digital líder en Puerto Rico.
@@ -66,7 +140,16 @@ ESTRUCTURA DE PUBLICACIÓN REQUERIDA:
    - VIDEO CAPTION: Resumen de 1-2 oraciones para el copy de redes sociales.
    - VIDEO SEARCH TAGS: 3 a 5 palabras clave de búsqueda de video que describan ÚNICAMENTE elementos visuales neutros (paisajes, objetos, acciones, lugares de Puerto Rico). PROHIBIDO usar "breaking news", "news anchor", "news studio", "broadcast" o cualquier frase que traiga b-roll con gráficos de noticiero ajenos incrustados.
 
-DEBES RESPONDER EXCLUSIVAMENTE EN FORMATO JSON VÁLIDO CON ESTA ESTRUCTURA EXACTA:
+3. DIRECCIÓN DE VIDEO (cómo debe armarse la pieza 9:16):
+   - TEMPLATE: "standard" (uso general), "reels-safe" (cuando el titular es largo o hay mucho texto en pantalla) o "app-promo" (solo si la noticia invita a descargar la app o es contenido de servicio/comunidad).
+   - DURATION_SEC: entero entre 8 y 18 según la densidad de la noticia (breve = 8-10, con contexto = 12-15).
+   - LEAD_WITH: "image" si el mejor recurso visual es una foto concreta (un mapa, un rostro, un lugar); "video" si conviene abrir con b-roll en movimiento.
+   - PACE: "urgente" (sucesos, clima severo, tribunales), "neutral" (informativo general) o "reposado" (análisis, cultura, comunidad).
+   - IMAGE_QUERY: 2-5 palabras en inglés para buscar la FOTO líder (elemento visual neutro y específico del tema).
+   - CLIP_QUERIES: 2-4 búsquedas de b-roll en inglés, EN ORDEN DE PRIORIDAD, mismas reglas que VIDEO SEARCH TAGS.
+   - HEADLINE_STYLE: "banner" (rótulo inferior sólido, por defecto), "lower_third" (franja baja discreta) o "center" (titular centrado, para frases muy cortas).
+
+DEBES RESPONDER EXCLUSIVAMENTE CON EL OBJETO JSON CRUDO, SIN NADA MÁS: sin bloques de código markdown (nada de \`\`\` ni \`\`\`json), sin texto de introducción ni de cierre, sin comentarios. El primer carácter de tu respuesta debe ser "{" y el último "}". ESTRUCTURA EXACTA:
 {
   "title": "Titular 100% original de Prensa Abierta",
   "subtitle": "Bajada informativa original",
@@ -76,7 +159,18 @@ DEBES RESPONDER EXCLUSIVAMENTE EN FORMATO JSON VÁLIDO CON ESTA ESTRUCTURA EXACT
   "video_headline": "Titular de impacto para video",
   "video_caption": "Texto breve para el cintillo de Reels",
   "video_search_tags": ["puerto rico weather", "heat wave", "sun tropics"],
-  "suggested_image_concept": "Mapa de calor o sol intenso sobre Puerto Rico"
+  "suggested_image_concept": "Mapa de calor o sol intenso sobre Puerto Rico",
+  "video_direction": {
+    "headline": "Titular corto para el rótulo 9:16",
+    "caption": "Copy breve para redes",
+    "template": "standard",
+    "duration_sec": 12,
+    "lead_with": "video",
+    "pace": "urgente",
+    "image_query": "heat map puerto rico",
+    "clip_queries": ["tropical sun heat", "puerto rico coastline", "city street hot day"],
+    "headline_style": "banner"
+  }
 }`;
 
   const userPrompt = `NOTICIA ORIGINAL DE ${sourceName}:
@@ -91,16 +185,12 @@ Genera la redacción editorial para Prensa Abierta en formato JSON.`;
       ? baseUrl
       : `${baseUrl.replace(/\/$/, '')}/chat/completions`;
 
-    console.log(`[IA Client] Llamando a ${endpoint} con modelo: ${model}`);
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    };
-
-    const res = await fetch(endpoint, {
+    const requestInit: RequestInit = {
       method: 'POST',
-      headers,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
       body: JSON.stringify({
         model,
         messages: [
@@ -110,6 +200,12 @@ Genera la redacción editorial para Prensa Abierta en formato JSON.`;
         temperature: 0.3,
         response_format: { type: 'json_object' },
       }),
+    };
+
+    // Serializado: una llamada a la vez, con reintento ante 429/503.
+    const res = await runSerialized(() => {
+      console.log(`[IA Client] Llamando a ${endpoint} con modelo: ${model}`);
+      return fetchIaWithRetry(endpoint, requestInit);
     });
 
     if (!res.ok) {
@@ -120,8 +216,8 @@ Genera la redacción editorial para Prensa Abierta en formato JSON.`;
     const data = await res.json();
     const contentStr = data.choices?.[0]?.message?.content || '{}';
 
-    // Parse JSON
-    const parsed = JSON.parse(contentStr);
+    // Parse tolerante: los modelos suelen envolver el JSON en ```json … ```.
+    const parsed = parseModelJson(contentStr);
 
     let formattedHtml = parsed.content_html || rawContent;
     if (!formattedHtml.includes('<p>')) {
@@ -131,20 +227,49 @@ Genera la redacción editorial para Prensa Abierta en formato JSON.`;
         .join('');
     }
 
+    const category = parsed.category || 'Noticias';
+    // Guardrail: sanea los tags aunque la IA ignore la instrucción del prompt
+    const videoSearchTags = sanitizeVideoSearchTags(
+      Array.isArray(parsed.video_search_tags) ? parsed.video_search_tags : ['puerto rico', 'ultimas noticias']
+    );
+    const suggestedImageConcept = parsed.suggested_image_concept || 'Noticia de Puerto Rico';
+
+    // La IA puede mandar la dirección anidada en `video_direction` o suelta
+    // (`video_headline` / `video_caption`); se acepta cualquiera y se sanea.
+    const rawDirection: Record<string, unknown> = {
+      source: 'ai',
+      headline: parsed.video_headline,
+      caption: parsed.video_caption,
+      ...(parsed.video_direction && typeof parsed.video_direction === 'object'
+        ? parsed.video_direction
+        : {}),
+    };
+    // Si la IA no puso `image_query` en la dirección pero sí un concepto de
+    // imagen, se usa como query de la foto líder.
+    if (!rawDirection.image_query && parsed.suggested_image_concept) {
+      rawDirection.image_query = parsed.suggested_image_concept;
+    }
+
     return {
+      source: 'ai',
       title: sanitizeBrandVoice(parsed.title || rawTitle),
       subtitle: sanitizeBrandVoice(parsed.subtitle || ''),
       content_html: sanitizeBrandVoice(formattedHtml),
-      category: parsed.category || 'Noticias',
+      category,
       tags: Array.isArray(parsed.tags) ? parsed.tags : ['Puerto Rico', 'Noticias'],
-      // Guardrail: sanea los tags aunque la IA ignore la instrucción del prompt
-      video_search_tags: sanitizeVideoSearchTags(
-        Array.isArray(parsed.video_search_tags) ? parsed.video_search_tags : ['puerto rico', 'ultimas noticias']
-      ),
-      suggested_image_concept: parsed.suggested_image_concept || 'Noticia de Puerto Rico',
+      video_search_tags: videoSearchTags,
+      suggested_image_concept: suggestedImageConcept,
+      video_direction: sanitizeVideoDirection(rawDirection, {
+        fallbackHeadline: sanitizeBrandVoice(parsed.title || rawTitle),
+        category,
+        videoSearchTags,
+      }),
     };
   } catch (error) {
-    console.warn('Conexión remota con IA no disponible o token inválido. Activando Motor Autónomo Editorial de Prensa Abierta...', error);
+    const msg = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `[IA] Falló la redacción remota (${msg}). Usando Motor Autónomo Editorial de Prensa Abierta.`
+    );
     return generateAutonomousEditorial(rawTitle, rawContent, sourceName);
   }
 }

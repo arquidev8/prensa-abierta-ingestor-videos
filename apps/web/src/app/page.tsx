@@ -91,10 +91,13 @@ export default function FeedPage() {
 
   const { getState: getRenderState, ensureRendered } = useVideoRenderCache();
 
-  const resetVideoEditor = () => {
+  // Al abrir una noticia, el "Editor de video" arranca desde la dirección de
+  // composición que generó la IA / Motor Autónomo (Capa 3): base imagen/video y
+  // plantilla. El usuario puede cambiarlas después y su elección manda.
+  const resetVideoEditor = (direction?: ProcessedNews['video_direction']) => {
     setVideoEditing(false);
-    setCompBase('video');
-    setVideoTemplate('standard');
+    setCompBase(direction?.lead_with ?? 'video');
+    setVideoTemplate(direction?.template ?? 'standard');
     setCustomImage(null);
     setCustomClip(null);
     setUploadingMedia(null);
@@ -204,7 +207,7 @@ export default function FeedPage() {
     setEditedContent(item.processed?.content_html || item.raw?.content || '');
     setModalTab('resumen');
     setEditing(false);
-    resetVideoEditor();
+    resetVideoEditor(item.processed?.video_direction);
   };
 
   const handleRunPipeline = async (item: RawNews, autoPublishWP: boolean = false) => {
@@ -298,6 +301,9 @@ export default function FeedPage() {
       template: videoTemplate,
       customImageUrl: compBase === 'image' ? customImage?.url : undefined,
       customClipUrl: compBase === 'video' ? customClip?.url : undefined,
+      // Capa 3: la dirección de la IA alimenta duración y queries de Pexels en
+      // /api/render-video (base/plantilla ya van arriba, derivadas de ella).
+      videoDirection: selectedItem.processed?.video_direction,
     };
   }, [
     selectedItem,
@@ -442,9 +448,9 @@ export default function FeedPage() {
               onChange={(e) => setSelectedModel(e.target.value)}
               className="bg-transparent text-slate-900 font-black focus:outline-none cursor-pointer"
             >
-              <option value="glm-5.2">GLM 5.2 / GLM-4</option>
+              <option value="glm-5.2">GLM 5.2</option>
               <option value="minimax-m3">MiniMax M3</option>
-              <option value="qwen2.5:72b">Qwen 2.5 72B</option>
+              <option value="qwen3.5:397b">Qwen 3.5 397B</option>
             </select>
           </div>
 
@@ -955,7 +961,7 @@ export default function FeedPage() {
                             title={displayTitle}
                             category={modalVideoCategory}
                             template={videoTemplate}
-                            duration={12}
+                            duration={selectedItem?.processed?.video_direction?.duration_sec || 12}
                             newsId={videoId}
                             renderState={videoRenderState}
                             onRetryRender={() => ensureRendered(videoRenderParams)}
@@ -1145,7 +1151,7 @@ export default function FeedPage() {
                         title={displayTitle}
                         category={modalVideoCategory}
                         template={videoTemplate}
-                        duration={12}
+                        duration={selectedItem?.processed?.video_direction?.duration_sec || 12}
                         newsId={videoId}
                         renderState={videoRenderState}
                         onRetryRender={() => ensureRendered(videoRenderParams)}

@@ -102,7 +102,10 @@ export default function AutopilotHubPage() {
           headline: item.title,
           category: videoCategoryFor(item),
           imageUrl: item.featured_image_url,
-          duration: 10,
+          // Capa 3: sin duración fija, /api/render-video usa la de la dirección de
+          // video (o su default de 12s); las queries de Pexels y la plantilla
+          // también salen de acá.
+          videoDirection: item.video_direction,
         }),
         signal: AbortSignal.timeout(130_000),
       });

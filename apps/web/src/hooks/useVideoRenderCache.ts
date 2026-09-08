@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useRef, useState } from 'react';
+import type { VideoDirection } from '@/lib/videoDirection';
 
 export type RenderStatus = 'idle' | 'rendering' | 'ready' | 'failed';
 
@@ -22,6 +23,10 @@ export interface RenderParams {
   customImageUrl?: string;
   customClipUrl?: string;
   duration?: number;
+  // Dirección de composición de la IA / Motor Autónomo (Capa 3). El modal ya
+  // inicializa `background`/`template` desde acá; el resto (duración, queries de
+  // Pexels) lo aplica /api/render-video.
+  videoDirection?: VideoDirection;
 }
 
 const IDLE_STATE: RenderState = { status: 'idle' };
@@ -31,6 +36,12 @@ const IDLE_STATE: RenderState = { status: 'idle' };
 // clave distinta y dispara un render nuevo, sin reusar el resultado de otra
 // combinación de ajustes.
 function buildKey(p: RenderParams): string {
+  const d = p.videoDirection;
+  // Firma compacta de la parte de la dirección que /api/render-video usa y que NO
+  // está ya cubierta por `background`/`template` (que el modal deriva de ella).
+  const dirSig = d
+    ? [d.duration_sec, d.image_query, (d.clip_queries || []).join(',')].join('|')
+    : '';
   return [
     p.newsId,
     p.headline,
@@ -39,6 +50,7 @@ function buildKey(p: RenderParams): string {
     p.template,
     p.customImageUrl || '',
     p.customClipUrl || '',
+    dirSig,
   ].join('::');
 }
 
@@ -83,7 +95,10 @@ export function useVideoRenderCache() {
             template: params.template,
             customImageUrl: params.customImageUrl,
             customClipUrl: params.customClipUrl,
-            duration: params.duration || 10,
+            // Sin duración explícita del modal, /api/render-video usa la de la
+            // dirección de video (o su default de 12s).
+            duration: params.duration,
+            videoDirection: params.videoDirection,
           }),
           signal: AbortSignal.timeout(130_000),
         });

@@ -1,3 +1,7 @@
+import type { VideoDirection } from './videoDirection';
+
+export type { VideoDirection };
+
 export interface RawNews {
   id: string;
   source_id: string;
@@ -24,6 +28,9 @@ export interface ProcessedNews {
   category: string;
   tags: string[];
   video_search_tags: string[];
+  /** Decisiones de composición del Reel 9:16. Opcional: noticias procesadas
+   *  antes de esta feature no lo traen (Capa 3 cae a los defaults). */
+  video_direction?: VideoDirection;
   featured_image_url?: string;
   wordpress_post_id?: number;
   wordpress_url?: string;
