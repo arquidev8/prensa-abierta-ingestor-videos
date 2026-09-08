@@ -13,7 +13,10 @@ services:
       - DATA_DIR=/app/data
       - ASSETS_DIR=/app/assets
       # Tamaño del worker pool que limita cuántos renders de FFmpeg corren en paralelo
-      - VIDEO_RENDER_WORKERS=2
+      - VIDEO_RENDER_WORKERS=${VIDEO_RENDER_WORKERS:-2}
+      - FFMPEG_PATH=${FFMPEG_PATH}
+      - LOGO_URL=${LOGO_URL}
+      - PROMO_IMAGE_URL=${PROMO_IMAGE_URL}
     volumes:
       - ./services/engine/data:/app/data
       - ./assets:/app/assets
@@ -25,23 +28,24 @@ services:
       dockerfile: Dockerfile
       args:
         # Usado por el bundle del navegador (build-time); debe ser la URL publicada en el host
-        - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8080}
+        - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8081}
     container_name: prensa_abierta_web
     ports:
       - "3001:3000"
     environment:
       # Usado únicamente por el bundle del navegador; en runtime del servidor NO tiene efecto
       # (Next.js incrusta NEXT_PUBLIC_* en build-time en todo el bundle, incluido el servidor)
-      - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8080}
+      - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8081}
       # Usado por el código de servidor (lib/engine.ts) en runtime real; DNS interno de docker
-      - ENGINE_INTERNAL_URL=http://engine:8080
+      - ENGINE_INTERNAL_URL=${ENGINE_INTERNAL_URL:-http://engine:8080}
       # URL por la que el Go Engine puede alcanzar a ESTE servicio (DNS interno de docker),
       # usada para construir clip_urls que el Engine descarga (ver process-news/route.ts y
       # render-video/route.ts). NO puede ser localhost: eso apuntaría al propio contenedor Engine.
-      - WEB_INTERNAL_URL=http://web:8080
-      - OLLAMA_CLOUD_BASE_URL=https://api.ollama.com/v1
+      - WEB_INTERNAL_URL=${WEB_INTERNAL_URL:-http://web:3000}
+      - OLLAMA_CLOUD_BASE_URL=${OLLAMA_CLOUD_BASE_URL}
       - OLLAMA_CLOUD_API_KEY=${OLLAMA_CLOUD_API_KEY}
-      - OLLAMA_MODEL=qwen2.5:72b
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - WP_DRY_RUN=${WP_DRY_RUN:-true}
       - WP_BASE_URL=${WP_BASE_URL}
       - WP_USERNAME=${WP_USERNAME}
       - WP_APPLICATION_PASSWORD=${WP_APPLICATION_PASSWORD}
