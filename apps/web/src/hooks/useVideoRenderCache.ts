@@ -80,9 +80,9 @@ export function useVideoRenderCache() {
     (async () => {
       try {
         // Timeout defensivo del lado del cliente: el servidor ya acota su propia
-        // espera (~120s) al pollear el job del Go Engine; este límite le da 10s de
-        // margen para que ese timeout/resultado llegue a tiempo antes de abortar
-        // el fetch, en vez de cortar la conexión primero.
+        // espera (MAX_WAIT_MS = 190s) al pollear el job del Go Engine; este límite
+        // le da margen para que ese timeout/resultado llegue antes de abortar el
+        // fetch, en vez de cortar la conexión primero.
         const res = await fetch('/api/render-video', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -100,7 +100,7 @@ export function useVideoRenderCache() {
             duration: params.duration,
             videoDirection: params.videoDirection,
           }),
-          signal: AbortSignal.timeout(130_000),
+          signal: AbortSignal.timeout(205_000),
         });
         const data = await res.json();
         if (res.ok && data.success && data.videoUrl) {

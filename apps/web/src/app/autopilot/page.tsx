@@ -91,9 +91,9 @@ export default function AutopilotHubPage() {
     try {
       setRenderingId(item.id);
       // Timeout defensivo del lado del cliente: el servidor ya acota su propia espera
-      // (~120s) al pollear el job del Go Engine, pero este límite adicional garantiza
-      // que el botón nunca quede "generando" para siempre ante un fallo de red, un
-      // proxy colgado, etc. — antes no existía ningún timeout en esta llamada.
+      // (MAX_WAIT_MS = 190s) al pollear el job del Go Engine, pero este límite adicional
+      // garantiza que el botón nunca quede "generando" para siempre ante un fallo de
+      // red, un proxy colgado, etc.
       const res = await fetch('/api/render-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -107,7 +107,7 @@ export default function AutopilotHubPage() {
           // también salen de acá.
           videoDirection: item.video_direction,
         }),
-        signal: AbortSignal.timeout(130_000),
+        signal: AbortSignal.timeout(205_000),
       });
       const data = await res.json();
       if (data.success && data.videoUrl) {

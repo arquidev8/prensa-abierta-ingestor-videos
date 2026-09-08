@@ -23,7 +23,11 @@ const defaultRenderQueueSize = 100
 
 // defaultRenderTimeout bounds how long a single FFmpeg render may run
 // before its context is cancelled by the worker that picked it up.
-const defaultRenderTimeout = 2 * time.Minute
+// 3 min: una composición puede encadenar descarga de imagen líder + descarga de
+// clip de b-roll (Pexels) + 2 transcodes + concat + overlay. La descarga de cada
+// recurso remoto está acotada aparte (downloadToTempFile), así que este límite
+// cubre el peor caso realista sin colgar el worker pool indefinidamente.
+const defaultRenderTimeout = 3 * time.Minute
 
 // Engine handles video assembly and rendering via FFmpeg
 type Engine struct {
@@ -282,6 +286,24 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	videoClipsAdded := 0
 	for i := 0; i < nClips; i++ {
 		clipURL := req.ClipURLs[i]
+
+		// Los clips remotos (Pexels, CDN) se descargan a un archivo local ANTES de
+		// pasarlos a FFmpeg. Darle una URL a `-i` hace que FFmpeg la baje por su
+		// cuenta SIN timeout: un clip HD grande de stock o un CDN lento agotaba el
+		// timeout de render y el proceso moría con `signal: killed`. Con la descarga
+		// acotada (60s) acá, un clip lento se saltea (continue) en vez de tumbar
+		// todo el render.
+		inputPath := clipURL
+		if strings.HasPrefix(clipURL, "http://") || strings.HasPrefix(clipURL, "https://") {
+			local, derr := e.downloadToTempFile(ctx, clipURL, "src_clip_*.mp4", 60*time.Second)
+			if derr != nil {
+				log.Printf("[VideoEngine] Warning: no se pudo descargar el clip %s: %v", clipURL, derr)
+				continue
+			}
+			defer os.Remove(local)
+			inputPath = local
+		}
+
 		trimmedPath := filepath.Join(tempDir, fmt.Sprintf("clip_%d.mp4", i))
 
 		// Scale & Crop to 9:16 (1080x1920) and trim
@@ -289,7 +311,7 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 		args := []string{
 			"-y",
 			"-t", fmt.Sprintf("%.2f", clipDuration),
-			"-i", clipURL,
+			"-i", inputPath,
 			"-vf", filter,
 			"-c:v", "libx264",
 			"-preset", "ultrafast",
@@ -391,7 +413,7 @@ func coverImageFilter(dur int) string {
 // para poder concatenarlo como PRIMER segmento de la composición. Devuelve la ruta
 // del archivo generado en tempDir.
 func (e *Engine) prepareImageSegment(ctx context.Context, tempDir, imageURL string, sec float64) (string, error) {
-	localImg, err := e.downloadToTempFile(ctx, imageURL)
+	localImg, err := e.downloadToTempFile(ctx, imageURL, "src_image_*.jpg", 20*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -432,7 +454,7 @@ func (e *Engine) renderImageZoomVideo(ctx context.Context, job *models.VideoJob,
 		duration = 12
 	}
 
-	localImagePath, err := e.downloadToTempFile(ctx, imageURL)
+	localImagePath, err := e.downloadToTempFile(ctx, imageURL, "src_image_*.jpg", 20*time.Second)
 	if err != nil {
 		log.Printf("[VideoEngine] Warning: no se pudo descargar la imagen %s: %v", imageURL, err)
 		return e.renderFallbackColorVideo(ctx, job, outputPath)
@@ -470,13 +492,15 @@ func (e *Engine) renderFallbackImageVideo(ctx context.Context, job *models.Video
 
 // downloadToTempFile descarga una URL a un archivo temporal en outputDir y
 // devuelve su ruta local. El llamador es responsable de borrarlo (defer os.Remove).
-func (e *Engine) downloadToTempFile(ctx context.Context, url string) (string, error) {
+// `pattern` es el patrón de os.CreateTemp (ej. "src_image_*.jpg", "src_clip_*.mp4");
+// `timeout` acota la descarga (los videos necesitan más que las imágenes).
+func (e *Engine) downloadToTempFile(ctx context.Context, url, pattern string, timeout time.Duration) (string, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
 
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return "", err
@@ -487,7 +511,7 @@ func (e *Engine) downloadToTempFile(ctx context.Context, url string) (string, er
 		return "", fmt.Errorf("status HTTP %d al descargar %s", resp.StatusCode, url)
 	}
 
-	tmpFile, err := os.CreateTemp(e.outputDir, "src_image_*.jpg")
+	tmpFile, err := os.CreateTemp(e.outputDir, pattern)
 	if err != nil {
 		return "", err
 	}

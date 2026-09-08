@@ -13,10 +13,10 @@ import { sanitizeVideoDirection, VideoDirection } from '@/lib/videoDirection';
 // casi nunca coincidían. Se eliminó esa duplicación: este endpoint ahora solo resuelve
 // el clip (con el mismo `seed` que usa el preview) y delega el render real al Engine.
 
-// 120s: el Go Engine acota cada render individual a 2 min (defaultRenderTimeout en
-// pkg/video/engine.go), así que este polling debe cubrir esa misma ventana para no
-// devolver un 504 justo antes de que el worker termine.
-const MAX_WAIT_MS = 120_000;
+// El Go Engine acota cada render individual a 3 min (defaultRenderTimeout en
+// pkg/video/engine.go), así que este polling debe cubrir esa misma ventana (+ un
+// margen) para no devolver un 504 justo antes de que el worker termine.
+const MAX_WAIT_MS = 190_000;
 const POLL_INTERVAL_MS = 1_500;
 
 // El clip que se pasa como `clip_urls` al Go Engine lo descarga el CONTENEDOR del
