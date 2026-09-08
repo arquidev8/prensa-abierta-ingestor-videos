@@ -56,9 +56,9 @@ export default function SettingsPage() {
                 onChange={(e) => setOllamaModel(e.target.value)}
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-xs sm:text-sm font-bold text-slate-900 focus:outline-none focus:border-[#FF5500]"
               >
-                <option value="glm-5.2">GLM 5.2 / GLM-4 (Zhipu AI - Máxima precisión y fluidez)</option>
-                <option value="minimax-m3">MiniMax M3 / Text (Capacidad narrativa avanzada)</option>
-                <option value="qwen2.5:72b">Qwen 2.5 72B (Excelente redacción en español)</option>
+                <option value="glm-5.2">GLM 5.2 (Zhipu AI - Máxima precisión y fluidez)</option>
+                <option value="minimax-m3">MiniMax M3 (Capacidad narrativa avanzada)</option>
+                <option value="qwen3.5:397b">Qwen 3.5 397B (Excelente redacción en español)</option>
               </select>
               <p className="text-[11px] text-slate-500">
                 Selecciona el modelo de lenguaje que redacta las noticias con el tono de Prensa Abierta.

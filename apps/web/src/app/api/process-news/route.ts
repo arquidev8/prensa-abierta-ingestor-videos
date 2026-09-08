@@ -17,9 +17,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Datos de noticia inválidos' }, { status: 400 });
     }
 
-    console.log(`[Pipeline] 1. Redactando noticia con IA (${ollamaModel || 'GLM / MiniMax'}): "${rawNews.title}"`);
+    const modelLabel = ollamaModel || process.env.OLLAMA_MODEL || 'glm-5.2';
+    console.log(`[Pipeline] 1. Redactando noticia (modelo IA: ${modelLabel}): "${rawNews.title}"`);
 
-    // 1. Redacción IA con GLM / MiniMax / Qwen
+    // 1. Redacción: IA remota; si falla, Motor Autónomo local (ver lib/ollama.ts).
     const editorial = await rewriteNewsWithOllamaCloud(
       rawNews.title,
       rawNews.content || rawNews.summary,
@@ -27,7 +28,15 @@ export async function POST(req: NextRequest) {
       { model: ollamaModel }
     );
 
-    console.log(`[Pipeline] 2. Redacción IA completada. Titular Prensa Abierta: "${editorial.title}"`);
+    const redactor = editorial.source === 'ai' ? `IA (${modelLabel})` : 'Motor Autónomo';
+    console.log(`[Pipeline] 2. Redacción completada por ${redactor}. Titular: "${editorial.title}"`);
+    const vd = editorial.video_direction;
+    console.log(
+      `[Pipeline]    Dirección de video [${vd.source || 'default'}]: ` +
+        `plantilla=${vd.template} dur=${vd.duration_sec}s base=${vd.lead_with} ritmo=${vd.pace} ` +
+        `image_query=${vd.image_query || '(ninguna → imagen de la noticia)'} ` +
+        `clip_queries=[${vd.clip_queries.join(' | ')}]`
+    );
 
     // 2. Buscar imagen del Banco de Medios por categoría
     const mediaList = await fetchMediaItems(editorial.category, 'image');
@@ -73,6 +82,9 @@ export async function POST(req: NextRequest) {
       category: editorial.category,
       tags: editorial.tags,
       video_search_tags: editorial.video_search_tags,
+      // Capa 2: se persiste la dirección de composición generada/saneada en Capa 1.
+      // Todavía nadie la consume para renderizar (eso es Capa 3).
+      video_direction: editorial.video_direction,
       featured_image_url: featuredImageUrl,
       wordpress_post_id: wpPostId,
       wordpress_url: wpUrl,

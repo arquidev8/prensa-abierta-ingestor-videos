@@ -55,6 +55,13 @@ const NEWS_CATEGORIES: NewsCategoryDefinition[] = [
       'futbol', 'soccer', 'olimpico', 'boxeo', 'atletismo', 'mlb', 'nba', 'nfl',
       'wnba', 'maraton', 'atleta', 'campeonato', 'seleccion nacional', 'entrenador',
       'liga de', 'juegos centroamericanos', 'medalla de oro',
+      // Grandes Ligas / MLB: nombres de equipos y jerga que aparecen en titulares
+      // de béisbol sin decir "béisbol" (ej. "Ohtani no volverá a lanzar por los Dodgers").
+      'grandes ligas', 'serie mundial', 'dodgers', 'yankees', 'mets', 'medias rojas',
+      'cerveceros', 'astros', 'padres', 'bravos', 'cachorros', 'lanzador', 'pitcheo',
+      'jonron', 'cuadrangular', 'bateador', 'spring training', 'roster', 'clasico mundial',
+      'lidom', 'doble a', 'liga de beisbol profesional', 'cangrejeros', 'criollos de caguas',
+      'ohtani', 'lindor', 'javier baez', 'edwin diaz',
     ],
   },
   {

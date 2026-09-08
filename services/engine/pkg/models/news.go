@@ -31,24 +31,43 @@ type RawNews struct {
 	Hash        string    `json:"hash"`   // For deduplication
 }
 
+// VideoDirection are the AI's (or autonomous engine's) COMPOSITION decisions for
+// the 9:16 Reel, kept separate from the web copy. Generado y saneado en el front
+// (apps/web/src/lib/videoDirection.ts); el Engine solo lo persiste y lo devuelve
+// para que /api/render-video lo consuma. Todos los campos son opcionales: una
+// noticia procesada antes de esta feature no lo trae.
+type VideoDirection struct {
+	Source        string   `json:"source,omitempty"` // "ai" | "autonomous"
+	Headline      string   `json:"headline,omitempty"`
+	Caption       string   `json:"caption,omitempty"`
+	Template      string   `json:"template,omitempty"`       // "standard" | "reels-safe" | "app-promo"
+	DurationSec   int      `json:"duration_sec,omitempty"`   // 8-18
+	LeadWith      string   `json:"lead_with,omitempty"`      // "image" | "video"
+	Pace          string   `json:"pace,omitempty"`           // "urgente" | "neutral" | "reposado"
+	ImageQuery    string   `json:"image_query,omitempty"`
+	ClipQueries   []string `json:"clip_queries,omitempty"`
+	HeadlineStyle string   `json:"headline_style,omitempty"` // "banner" | "lower_third" | "center"
+}
+
 // ProcessedNews represents the AI-rewritten article for Prensa Abierta
 type ProcessedNews struct {
-	ID               string    `json:"id"`
-	RawNewsID        string    `json:"raw_news_id"`
-	Title            string    `json:"title"`
-	Subtitle         string    `json:"subtitle"`
-	ContentHTML      string    `json:"content_html"`
-	Category         string    `json:"category"`
-	Tags             []string  `json:"tags"`
-	VideoSearchTags  []string  `json:"video_search_tags"`
-	FeaturedImageURL string    `json:"featured_image_url,omitempty"`
-	WordPressPostID  int       `json:"wordpress_post_id,omitempty"`
-	WordPressURL     string    `json:"wordpress_url,omitempty"`
-	VideoStatus      string    `json:"video_status"` // "none", "rendering", "ready", "failed"
-	VideoURL         string    `json:"video_url,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	PublishedAt      time.Time `json:"published_at,omitempty"`
-	Status           string    `json:"status"` // "draft", "published", "scheduled"
+	ID               string          `json:"id"`
+	RawNewsID        string          `json:"raw_news_id"`
+	Title            string          `json:"title"`
+	Subtitle         string          `json:"subtitle"`
+	ContentHTML      string          `json:"content_html"`
+	Category         string          `json:"category"`
+	Tags             []string        `json:"tags"`
+	VideoSearchTags  []string        `json:"video_search_tags"`
+	VideoDirection   *VideoDirection `json:"video_direction,omitempty"`
+	FeaturedImageURL string          `json:"featured_image_url,omitempty"`
+	WordPressPostID  int             `json:"wordpress_post_id,omitempty"`
+	WordPressURL     string          `json:"wordpress_url,omitempty"`
+	VideoStatus      string          `json:"video_status"` // "none", "rendering", "ready", "failed"
+	VideoURL         string          `json:"video_url,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
+	PublishedAt      time.Time       `json:"published_at,omitempty"`
+	Status           string          `json:"status"` // "draft", "published", "scheduled"
 }
 
 // VideoRenderRequest represents the payload to assemble a 10-15s vertical video

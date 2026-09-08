@@ -110,8 +110,16 @@ export async function searchPexelsVideos(
         if (data.videos && data.videos.length > 0) {
           const clipUrls = data.videos
             .map((v: any) => {
+              // El clip lo baja el Go Engine y lo recorta a 1080x1920. Se elige el
+              // archivo VERTICAL más chico que aún sirva para esa resolución
+              // (height >= 1080): un HD/UHD gigante multiplica la descarga y el
+              // transcode y agotaba el timeout de render.
+              const portrait = (v.video_files || [])
+                .filter((f: any) => f.width && f.height && f.height > f.width)
+                .sort((a: any, b: any) => a.height - b.height);
               const file =
-                v.video_files.find((f: any) => f.height > f.width && f.quality === 'hd') ||
+                portrait.find((f: any) => f.height >= 1080) ||
+                portrait[portrait.length - 1] ||
                 v.video_files[0];
               return file ? file.link : null;
             })

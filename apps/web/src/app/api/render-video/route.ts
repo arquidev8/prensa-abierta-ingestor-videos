@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { resolveComposition } from '@/lib/contentLibrary';
 import { searchPexelsVideos, searchPexelsPhotos } from '@/lib/pexels';
 import { requestVideoRender, checkVideoJob } from '@/lib/engine';
+import { sanitizeVideoDirection, VideoDirection } from '@/lib/videoDirection';
 
 // Único pipeline de renderizado de video: el Go Engine (services/engine), con su
 // worker pool de tamaño acotado. Antes existía una segunda implementación de FFmpeg
@@ -12,10 +13,10 @@ import { requestVideoRender, checkVideoJob } from '@/lib/engine';
 // casi nunca coincidían. Se eliminó esa duplicación: este endpoint ahora solo resuelve
 // el clip (con el mismo `seed` que usa el preview) y delega el render real al Engine.
 
-// 120s: el Go Engine acota cada render individual a 2 min (defaultRenderTimeout en
-// pkg/video/engine.go), así que este polling debe cubrir esa misma ventana para no
-// devolver un 504 justo antes de que el worker termine.
-const MAX_WAIT_MS = 120_000;
+// El Go Engine acota cada render individual a 3 min (defaultRenderTimeout en
+// pkg/video/engine.go), así que este polling debe cubrir esa misma ventana (+ un
+// margen) para no devolver un 504 justo antes de que el worker termine.
+const MAX_WAIT_MS = 190_000;
 const POLL_INTERVAL_MS = 1_500;
 
 // El clip que se pasa como `clip_urls` al Go Engine lo descarga el CONTENEDOR del
@@ -43,6 +44,7 @@ export async function POST(req: NextRequest) {
       template,
       customImageUrl,
       customClipUrl,
+      videoDirection,
     } = body as {
       newsId?: string;
       headline?: string;
@@ -53,6 +55,11 @@ export async function POST(req: NextRequest) {
       // 'image' => composición liderada por la imagen inicial, sin clip de b-roll
       // (elegido desde el "Editor de video" del modal). 'video' / undefined => flujo normal.
       background?: 'image' | 'video';
+      // Capa 3: la "dirección de composición" generada por la IA / Motor Autónomo
+      // (apps/web/src/lib/videoDirection.ts), leída del ProcessedNews. Influye en
+      // duración, plantilla, base (imagen/video) y las queries de Pexels. Las
+      // elecciones explícitas del "Editor de video" (background/template) siguen
+      // teniendo prioridad — el front ya las inicializa desde esta dirección.
       // Plantilla de layout: 'reels-safe' aplica la guía .agents/formato-video-reel.md;
       // 'app-promo' es igual a 'standard' pero con el banner "Descarga la App GRATIS"
       // quemado debajo del titular (ver layoutFor() en el Go Engine).
@@ -63,11 +70,22 @@ export async function POST(req: NextRequest) {
       // automáticamente.
       customImageUrl?: string;
       customClipUrl?: string;
+      videoDirection?: VideoDirection;
     };
 
     if (!headline) {
       return NextResponse.json({ error: 'El titular (headline) es requerido' }, { status: 400 });
     }
+
+    // Se re-sanea aunque venga ya saneada de Capa 1: puede llegar de un registro
+    // viejo (sin dirección) o manipulada. Con `videoDirection` ausente devuelve
+    // una dirección por defecto derivada del contexto, así el resto del código
+    // siempre trabaja con un objeto completo.
+    const dir = sanitizeVideoDirection(videoDirection, {
+      fallbackHeadline: headline,
+      category: category || '',
+      videoSearchTags: tags,
+    });
 
     const effectiveNewsId = newsId || `news_${Date.now()}`;
     const origin = WEB_INTERNAL_URL || req.nextUrl.origin;
@@ -87,7 +105,9 @@ export async function POST(req: NextRequest) {
 
     // Si el usuario eligió "Imagen" como base en el Editor de video, se omite por
     // completo el clip de b-roll: la pieza se arma solo con la imagen inicial.
-    const imageOnly = background === 'image';
+    // `background` (elección explícita del modal) manda; si no vino, se usa el
+    // `lead_with` de la dirección de video.
+    const imageOnly = (background || dir.lead_with) === 'image';
 
     // ── Paso 2: IMAGEN líder ────────────────────────────────────────────────
     // La imagen importada por el usuario (Editor de video) tiene prioridad sobre
@@ -103,13 +123,20 @@ export async function POST(req: NextRequest) {
         ? `banco (${comp.leadImage.fileName})`
         : '';
 
+    // Con un tema del banco identificado, la query curada del tema es la mejor;
+    // sin tema, la `image_query` de la IA (un concepto visual concreto) gana a las
+    // "palabras sueltas del titular" que arma resolveComposition.
+    const photoQuery = comp.matchedTopic
+      ? comp.imagePexelsQuery
+      : dir.image_query || comp.imagePexelsQuery;
+
     const tryPexelsPhoto = async () => {
-      if (leadImageUrl || !comp.imagePexelsQuery) return;
+      if (leadImageUrl || !photoQuery) return;
       try {
-        const pics = await searchPexelsPhotos(comp.imagePexelsQuery);
+        const pics = await searchPexelsPhotos(photoQuery);
         if (pics.length > 0) {
           leadImageUrl = pics[0];
-          leadImageSource = 'pexels';
+          leadImageSource = `pexels (${photoQuery})`;
         }
       } catch (e) {
         console.warn('[render-video] Búsqueda de foto en Pexels falló:', e);
@@ -124,9 +151,10 @@ export async function POST(req: NextRequest) {
     if (comp.matchedTopic) {
       await tryPexelsPhoto();
     } else {
-      // Sin tema: la foto propia de la noticia es el mejor candidato; si no hay,
-      // Pexels con las palabras del titular.
-      if (imageUrl) {
+      // Sin tema del banco: la foto propia de la noticia es el mejor candidato
+      // (es DE esa noticia). Solo si no hay, se va a Pexels con la `image_query`
+      // de la IA — o, si no la hay, las palabras del titular.
+      if (!leadImageUrl && imageUrl) {
         leadImageUrl = imageUrl;
         leadImageSource = 'destacada de la noticia';
       }
@@ -135,32 +163,76 @@ export async function POST(req: NextRequest) {
 
     // ── Paso 3: VIDEO de la misma carpeta ──────────────────────────────────
     // El video importado por el usuario (Editor de video) tiene prioridad sobre
-    // el resuelto automáticamente por categoría/tema.
+    // todo lo demás.
     let videoClipUrl: string | undefined = imageOnly
       ? undefined
       : customClipUrl
         ? abs(customClipUrl)
-        : comp.video
-          ? abs(comp.video.streamUrl)
-          : undefined;
-    let videoSource = customClipUrl
-      ? 'importado por el usuario'
-      : videoClipUrl
-        ? `banco (${comp.video!.fileName})`
-        : '';
-    if (!imageOnly && !videoClipUrl && comp.videoPexelsQuery) {
-      try {
-        const pex = await searchPexelsVideos(comp.videoPexelsQuery, category || 'general');
-        if (pex.length > 0) {
-          videoClipUrl = pex[0];
-          videoSource = 'pexels';
-        }
-      } catch (e) {
-        console.warn('[render-video] Búsqueda de video en Pexels falló:', e);
+        : undefined;
+    let videoSource = customClipUrl ? 'importado por el usuario' : '';
+
+    // Cuándo las clip_queries de la IA (dirigidas al asunto real de la noticia)
+    // le ganan al clip del banco: cuando ese clip NO es específico del tema —
+    // sea porque la carpeta es el bucket de respaldo, porque no se detectó tema,
+    // o porque el único clip disponible en la carpeta es el genérico (no hay un
+    // `Sucesos-crimen.mp4`, solo `Sucesos 1.mp4`). Un clip del banco que SÍ es
+    // del tema (curado y on-topic) sigue teniendo prioridad. Solo aplica a
+    // direcciones de IA real (no al Motor Autónomo, cuyas queries son genéricas).
+    const bankClipIsGeneric = !!comp.video && !comp.videoIsTopicMatch;
+    const preferAiClips =
+      !imageOnly &&
+      !videoClipUrl &&
+      dir.source === 'ai' &&
+      dir.clip_queries.length > 0 &&
+      (comp.matchedFolderIsFallback || !comp.matchedTopic || bankClipIsGeneric);
+
+    // 1. Clip del banco (salvo que prefiramos las clip_queries de la IA).
+    let bankClipDeferred = false;
+    if (!imageOnly && !videoClipUrl && comp.video) {
+      if (preferAiClips) {
+        bankClipDeferred = true;
+      } else {
+        videoClipUrl = abs(comp.video.streamUrl);
+        videoSource = `banco ${comp.videoIsTopicMatch ? 'tema' : 'genérico'} (${comp.video.fileName})`;
       }
     }
-    // Último recurso: el video genérico de la carpeta (si Pexels no devolvió nada
-    // para un tema sin clip propio — ej. Pexels no configurado).
+
+    // 2. Pexels: lista ordenada de queries. Cuando preferimos las de la IA van
+    // primero (más específicas de la noticia), con la query curada del tema como
+    // respaldo; en el flujo normal, primero la query del banco/tema y las de la
+    // IA de refuerzo. Se prueba cada una hasta que Pexels devuelva algo.
+    let aiClipQueryUsed = false;
+    if (!imageOnly && !videoClipUrl) {
+      const clipQueries = (
+        preferAiClips
+          ? [...dir.clip_queries, comp.topicPexelsQuery, comp.videoPexelsQuery]
+          : comp.matchedTopic
+            ? [comp.videoPexelsQuery, ...dir.clip_queries, comp.topicPexelsQuery]
+            : [...dir.clip_queries, comp.videoPexelsQuery]
+      ).filter((q, i, arr): q is string => !!q && arr.indexOf(q) === i);
+
+      for (const q of clipQueries) {
+        try {
+          const pex = await searchPexelsVideos(q, category || 'general');
+          if (pex.length > 0) {
+            videoClipUrl = pex[0];
+            videoSource = `pexels (${q})`;
+            aiClipQueryUsed = dir.clip_queries.includes(q);
+            break;
+          }
+        } catch (e) {
+          console.warn('[render-video] Búsqueda de video en Pexels falló:', e);
+        }
+      }
+    }
+
+    // 3. El clip del banco que se difirió en el paso 1, si Pexels no dio nada.
+    if (!imageOnly && !videoClipUrl && bankClipDeferred && comp.video) {
+      videoClipUrl = abs(comp.video.streamUrl);
+      videoSource = `banco ${comp.videoIsTopicMatch ? 'tema' : 'genérico'} (${comp.video.fileName})`;
+    }
+
+    // 4. Último recurso: el video genérico de la carpeta.
     if (!imageOnly && !videoClipUrl && comp.videoFallback) {
       videoClipUrl = abs(comp.videoFallback.streamUrl);
       videoSource = `banco genérico (${comp.videoFallback.fileName})`;
@@ -168,9 +240,25 @@ export async function POST(req: NextRequest) {
 
     const clipUrls: string[] = videoClipUrl ? [videoClipUrl] : [];
 
+    // `template` explícito del modal manda; si no vino, el de la dirección de video.
+    const effectiveTemplate = template || dir.template;
+    // `duration` explícito del modal manda; si no vino, el de la dirección (8-18,
+    // ya acotado por sanitizeVideoDirection).
+    const effectiveDuration = duration || dir.duration_sec;
+
+    // ¿Ayudó la IA a componer? Se registra el origen de la dirección y si sus
+    // clip_queries terminaron eligiendo el b-roll o las pisó un clip del banco.
+    const aiClipsNote = aiClipQueryUsed
+      ? 'clip_queries_IA=usadas'
+      : dir.source === 'ai' && dir.clip_queries.length > 0 && videoSource.startsWith('banco')
+        ? `clip_queries_IA=descartadas (ganó ${videoSource})`
+        : 'clip_queries_IA=n/a';
+
     console.log(
-      `[render-video] carpeta="${comp.matchedFolder}" tema="${comp.matchedTopic || '-'}" ` +
-        `imagen=${leadImageSource || 'ninguna'} video=${videoSource || 'ninguno'}`
+      `[render-video] carpeta="${comp.matchedFolder}"${comp.matchedFolderIsFallback ? '(respaldo)' : ''} ` +
+        `tema="${comp.matchedTopic || '-'}" dir=${dir.source || 'default'} ` +
+        `imagen=${leadImageSource || 'ninguna'} video=${videoSource || 'ninguno'} ` +
+        `plantilla=${effectiveTemplate} dur=${effectiveDuration}s base=${imageOnly ? 'imagen' : 'video'} ${aiClipsNote}`
     );
 
     const { job_id } = await requestVideoRender({
@@ -186,9 +274,13 @@ export async function POST(req: NextRequest) {
       // Engine NO debe sustituir por un clip genérico de la categoría cuando
       // clip_urls viene vacío.
       no_category_fallback: !!comp.matchedTopic || imageOnly,
-      duration_sec: duration || 12,
+      duration_sec: effectiveDuration,
       template:
-        template === 'reels-safe' ? 'reels-safe' : template === 'app-promo' ? 'app-promo' : 'standard',
+        effectiveTemplate === 'reels-safe'
+          ? 'reels-safe'
+          : effectiveTemplate === 'app-promo'
+            ? 'app-promo'
+            : 'standard',
     });
 
     // El Engine renderiza de forma asíncrona (worker pool); hacemos polling acotado

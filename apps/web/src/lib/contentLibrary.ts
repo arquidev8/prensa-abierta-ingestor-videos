@@ -778,6 +778,10 @@ function pickSeeded<T>(arr: T[], seed?: string): T | undefined {
 
 export interface CompositionResolution {
   matchedFolder: string;
+  // true = la categoría de la noticia NO matcheó ninguna carpeta y se cayó al
+  // bucket genérico (`Ahora`) o a "cualquier carpeta con assets". En ese caso el
+  // b-roll del banco no es temático y el caller puede preferir Pexels dirigido.
+  matchedFolderIsFallback: boolean;
   matchedTopic?: string;
   // Paso 2 — IMAGEN líder (primer segmento, con zoom): archivo del banco.
   leadImage: CategoryVideoInfo | null;
@@ -786,9 +790,17 @@ export interface CompositionResolution {
   imagePexelsQuery?: string;
   // Paso 3 — VIDEO (segundo segmento): archivo de la MISMA carpeta.
   video: CategoryVideoInfo | null;
+  // true = `video` es un clip ESPECÍFICO del tema (ej. `Sucesos-crimen.mp4`);
+  // false = es el genérico de la carpeta (`Sucesos 1.mp4`), porque no había uno
+  // del tema. El caller puede preferir las clip_queries de la IA sobre un genérico.
+  videoIsTopicMatch: boolean;
   // Query de Pexels para el video cuando: hay un tema identificado sin clip propio,
   // o (sin tema) la carpeta no tiene ningún video.
   videoPexelsQuery?: string;
+  // Query curada del tema (ej. "crime scene police tape night city"), SIEMPRE que
+  // haya tema — aunque el banco tenga un clip. El caller la usa como respaldo de
+  // Pexels cuando decide saltarse un clip genérico del banco.
+  topicPexelsQuery?: string;
   // Video GENÉRICO de la carpeta, usado SOLO como último recurso si `video` es null
   // y Pexels (`videoPexelsQuery`) tampoco devuelve nada — evita que una noticia con
   // tema pero sin clip propio se quede sin b-roll si Pexels no está configurado.
@@ -812,7 +824,13 @@ export function resolveComposition(
   seed?: string,
   query?: string
 ): CompositionResolution {
-  const empty: CompositionResolution = { matchedFolder: '', leadImage: null, video: null };
+  const empty: CompositionResolution = {
+    matchedFolder: '',
+    matchedFolderIsFallback: true,
+    leadImage: null,
+    video: null,
+    videoIsTopicMatch: false,
+  };
   const folders = getAllCategoryFolders();
   if (folders.length === 0) return empty;
 
@@ -822,12 +840,17 @@ export function resolveComposition(
 
   // Paso 1: categoría (+ titular, si la categoría es genérica) → carpeta.
   const targetName = resolveCategoryFolderName(categoryName, tags, query);
+  const categoryFolder =
+    byName(targetName) && hasAssets(byName(targetName)!) ? byName(targetName) : undefined;
   const folder =
-    (byName(targetName) && hasAssets(byName(targetName)!) ? byName(targetName) : undefined) ||
+    categoryFolder ||
     (byName(FALLBACK_FOLDER) && hasAssets(byName(FALLBACK_FOLDER)!) ? byName(FALLBACK_FOLDER) : undefined) ||
     folders.find(hasAssets);
 
   if (!folder) return empty;
+
+  // La carpeta es "de respaldo" si no vino de un match real de categoría.
+  const matchedFolderIsFallback = !categoryFolder;
 
   const toInfo = (f: MediaFile): CategoryVideoInfo => ({
     category: categoryName || folder.name,
@@ -894,11 +917,14 @@ export function resolveComposition(
 
   return {
     matchedFolder: folder.name,
+    matchedFolderIsFallback,
     matchedTopic: topic?.token,
     leadImage: imgFile ? toInfo(imgFile) : null,
     // Pexels para la imagen siempre que el banco no tenga una relevante.
     imagePexelsQuery: imgFile ? undefined : pexelsHint,
     video: vidFile ? toInfo(vidFile) : null,
+    videoIsTopicMatch: !!topicVid && vidFile === topicVid,
+    topicPexelsQuery: topic ? topic.pexels : undefined,
     videoPexelsQuery: vidFile ? undefined : pexelsHint,
     videoFallback: !vidFile && anyVid ? toInfo(anyVid) : null,
   };
