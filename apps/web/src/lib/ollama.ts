@@ -30,12 +30,12 @@ export interface OllamaConfig {
 // Se encadenan de a una, con una pausa corta entre llamadas, y se reintenta con
 // backoff ante 429/503 antes de rendirse.
 let aiCallChain: Promise<unknown> = Promise.resolve();
-const AI_CALL_SPACING_MS = 600;
+const AI_CALL_SPACING_MS = 2000; // Ollama Pro: 1 request concurrente → espaciamos 2s entre llamadas
 
 function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
   const result = aiCallChain.then(fn, fn);
   aiCallChain = result
-    .catch(() => {})
+    .catch(() => { })
     .then(() => new Promise((r) => setTimeout(r, AI_CALL_SPACING_MS)));
   return result;
 }
@@ -43,7 +43,7 @@ function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
 async function fetchIaWithRetry(
   endpoint: string,
   init: RequestInit,
-  maxAttempts = 3,
+  maxAttempts = 5,
   timeoutMs = 60_000
 ): Promise<Response> {
   let lastRes: Response | null = null;
@@ -51,12 +51,31 @@ async function fetchIaWithRetry(
     // Timeout por intento: una redacción larga tarda 15-25s; si a los 60s no
     // respondió, se aborta y se cae al Motor Autónomo en vez de colgar el pipeline.
     const res = await fetch(endpoint, { ...init, signal: AbortSignal.timeout(timeoutMs) });
-    if (res.status !== 429 && res.status !== 503) return res;
-    lastRes = res;
+
+    // Ollama Cloud a veces devuelve "too many concurrent requests" con status 200
+    // en lugar de 429. Se clona la respuesta para leer el body sin consumirlo.
+    if (res.status === 429 || res.status === 503) {
+      lastRes = res;
+    } else if (res.status === 200) {
+      // Peek al body: si contiene el error de concurrencia, tratar como 429.
+      const clone = res.clone();
+      let bodyText = '';
+      try { bodyText = await clone.text(); } catch { /* ignore */ }
+      if (bodyText.includes('too many concurrent requests')) {
+        console.warn(`[IA Client] Ollama: too many concurrent requests (intento ${attempt}/${maxAttempts})`);
+        lastRes = res;
+      } else {
+        // Respuesta 200 válida: devolver una Response reconstruida con el body ya leído.
+        return new Response(bodyText, { status: res.status, headers: res.headers });
+      }
+    } else {
+      return res;
+    }
+
     if (attempt < maxAttempts) {
-      const backoff = 800 * 2 ** (attempt - 1); // 0.8s, 1.6s
+      const backoff = 3000 * 2 ** (attempt - 1); // 3s, 6s, 12s, 24s — Ollama Pro necesita tiempo
       console.warn(
-        `[IA Client] ${res.status} de la API IA; reintento ${attempt}/${maxAttempts - 1} en ${backoff}ms`
+        `[IA Client] Rate limit en API IA; reintento ${attempt}/${maxAttempts - 1} en ${backoff}ms`
       );
       await new Promise((r) => setTimeout(r, backoff));
     }
@@ -104,7 +123,7 @@ export async function rewriteNewsWithOllamaCloud(
 
   const apiKey =
     config?.apiKey ||
-    process.env.OLLAMA_CLOUD_API_KEY; 
+    process.env.OLLAMA_CLOUD_API_KEY;
 
   let model = config?.model || process.env.OLLAMA_MODEL || 'glm-5.2';
 
