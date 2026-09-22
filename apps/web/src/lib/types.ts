@@ -58,6 +58,8 @@ export interface VideoJob {
   output_path?: string;
   output_url?: string;
   error?: string;
+  /** Estado de la locución: 'ok', 'disabled' (sin API key), 'failed: …' o vacío (no se pidió). */
+  voice_status?: string;
   created_at: string;
   completed_at?: string;
 }

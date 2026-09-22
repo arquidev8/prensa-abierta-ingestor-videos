@@ -68,14 +68,27 @@ export async function requestVideoRender(payload: {
   // Plantilla de composición: 'reels-safe' sube el bloque de titular a la safe zone
   // del grid 1:1 y separa más el logo. '' / 'standard' = layout por defecto.
   template?: 'standard' | 'reels-safe' | 'app-promo';
-}): Promise<{ job_id: string; job: VideoJob }> {
+  // Guion de la locución (ver lib/voiceScript.ts). Si viene y el Engine tiene
+  // ELEVENLABS_API_KEY, lo convierte en voz y la mezcla al video; vacío = video mudo.
+  voice_text?: string;
+}, authToken: string): Promise<{ job_id: string; job: VideoJob }> {
+  // El Engine exige sesión (Bearer) para encolar renders y aplica ahí el límite diario por rol.
   const res = await fetch(`${ENGINE_URL}/api/video/render`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
-    throw new Error(`Go Engine respondió ${res.status} al encolar el render de video`);
+    // Se conserva el mensaje del Engine (ej. "Límite diario de 5 videos alcanzado…") y su status
+    // para que la ruta lo devuelva tal cual al usuario en vez de un 500 genérico.
+    let message = `Go Engine respondió ${res.status} al encolar el render de video`;
+    try {
+      const body = await res.json();
+      if (body?.error) message = body.error;
+    } catch {
+      // cuerpo no-JSON: se deja el mensaje genérico
+    }
+    throw Object.assign(new Error(message), { status: res.status });
   }
   return await res.json();
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prensa-abierta/ingestor-engine/pkg/models"
+	"github.com/prensa-abierta/ingestor-engine/pkg/voice"
 )
 
 // defaultRenderQueueSize is how many jobs can wait in the queue before
@@ -35,7 +36,8 @@ type Engine struct {
 	assetsDir   string
 	outputDir   string
 	defaultLogo string
-	promoImage  string // banner "Descarga la App GRATIS", solo para el template "app-promo"
+	promoImage  string        // banner "Descarga la App GRATIS", solo para el template "app-promo"
+	voice       *voice.Client // nil = locución desactivada (sin ELEVENLABS_API_KEY)
 
 	mu   sync.Mutex // protege jobs y las mutaciones de sus campos
 	jobs map[string]*models.VideoJob
@@ -198,8 +200,12 @@ func (e *Engine) RenderVideo(ctx context.Context, jobID string) (*models.VideoJo
 		return job, err
 	}
 
+	// Locución (opcional): nunca falla el render, a lo sumo el video queda mudo.
+	voiceStatus := e.applyVoiceover(ctx, job, outputPath)
+
 	now := time.Now()
 	e.mu.Lock()
+	job.VoiceStatus = voiceStatus
 	job.Status = "completed"
 	job.Progress = 100
 	job.OutputPath = outputPath
@@ -786,10 +792,10 @@ func layoutFor(template string) overlayLayout {
 		return overlayLayout{
 			boxY: "ih-604", boxH: "604",
 			catDotY: "h-525", catTextY: "h-524",
-			headY:           "h-454",
-			headYOffset:     454,
-			headLineSpacing: 18,
-			logoY:           92,
+			headY:             "h-454",
+			headYOffset:       454,
+			headLineSpacing:   18,
+			logoY:             92,
 			showPromo:         true,
 			promoWidth:        560,
 			promoBottomMargin: 34,

@@ -51,6 +51,8 @@ assets/uploads/
 # Go engine runtime data & compiled binaries
 services/engine/bin/
 services/engine/data/videos/
+# Usuarios del Engine (hashes bcrypt): nunca se versionan
+services/engine/data/users.json
 **/cmd/server/data/
 
 # OS and Editor files
@@ -73,3 +75,9 @@ skills-lock.json
 # Other
 .agents
 .doc
+
+# Caché de audios de locución (ElevenLabs)
+services/engine/data/voice_cache/
+
+# Respaldos locales manuales de la data del Engine (nunca se versionan)
+services/engine/data/*.LOCAL-BACKUP

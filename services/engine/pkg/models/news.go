@@ -40,10 +40,10 @@ type VideoDirection struct {
 	Source        string   `json:"source,omitempty"` // "ai" | "autonomous"
 	Headline      string   `json:"headline,omitempty"`
 	Caption       string   `json:"caption,omitempty"`
-	Template      string   `json:"template,omitempty"`       // "standard" | "reels-safe" | "app-promo"
-	DurationSec   int      `json:"duration_sec,omitempty"`   // 8-18
-	LeadWith      string   `json:"lead_with,omitempty"`      // "image" | "video"
-	Pace          string   `json:"pace,omitempty"`           // "urgente" | "neutral" | "reposado"
+	Template      string   `json:"template,omitempty"`     // "standard" | "reels-safe" | "app-promo"
+	DurationSec   int      `json:"duration_sec,omitempty"` // 8-18
+	LeadWith      string   `json:"lead_with,omitempty"`    // "image" | "video"
+	Pace          string   `json:"pace,omitempty"`         // "urgente" | "neutral" | "reposado"
 	ImageQuery    string   `json:"image_query,omitempty"`
 	ClipQueries   []string `json:"clip_queries,omitempty"`
 	HeadlineStyle string   `json:"headline_style,omitempty"` // "banner" | "lower_third" | "center"
@@ -72,11 +72,11 @@ type ProcessedNews struct {
 
 // VideoRenderRequest represents the payload to assemble a 10-15s vertical video
 type VideoRenderRequest struct {
-	NewsID        string   `json:"news_id"`
-	Headline      string   `json:"headline"`
-	Category      string   `json:"category"`
-	ClipURLs      []string `json:"clip_urls"`     // 2-3 clip paths or URLs
-	ImageURL      string   `json:"image_url"`     // fallback: imagen destacada de la noticia si no hay clip de video
+	NewsID   string   `json:"news_id"`
+	Headline string   `json:"headline"`
+	Category string   `json:"category"`
+	ClipURLs []string `json:"clip_urls"` // 2-3 clip paths or URLs
+	ImageURL string   `json:"image_url"` // fallback: imagen destacada de la noticia si no hay clip de video
 	// LeadImageURL, si está presente, se renderiza como PRIMER segmento del video
 	// (imagen fija con zoom corto) seguido de los clips de ClipURLs — composición
 	// "imagen temática + video". Si ClipURLs viene vacío, se anima toda la duración.
@@ -85,12 +85,12 @@ type VideoRenderRequest struct {
 	// true = si ClipURLs viene vacío, NO buscar un clip de plantilla por categoría;
 	// ir directo a imagen (con zoom) o color. Lo usa el frontend cuando identificó
 	// un tema específico sin video propio en el banco.
-	NoCategoryFallback bool `json:"no_category_fallback"`
-	DurationSec   int      `json:"duration_sec"`  // usually 12-15s
-	MusicTrack    string   `json:"music_track"`   // optional preset or custom audio path
-	Resolution    string   `json:"resolution"`    // "1080x1920" (vertical 9:16)
-	ShowLogo      bool     `json:"show_logo"`     // true to overlay Prensa Abierta logo
-	HeadlineStyle string   `json:"headline_style"` // "lower_third", "banner", "center"
+	NoCategoryFallback bool   `json:"no_category_fallback"`
+	DurationSec        int    `json:"duration_sec"`   // usually 12-15s
+	MusicTrack         string `json:"music_track"`    // optional preset or custom audio path
+	Resolution         string `json:"resolution"`     // "1080x1920" (vertical 9:16)
+	ShowLogo           bool   `json:"show_logo"`      // true to overlay Prensa Abierta logo
+	HeadlineStyle      string `json:"headline_style"` // "lower_third", "banner", "center"
 	// Template de composición: "" / "standard" = layout por defecto; "reels-safe" =
 	// plantilla optimizada para Instagram Reels (bloque de titular elevado a la safe
 	// zone del grid 1:1, logo más separado del borde, interlineado compacto); "app-promo" =
@@ -100,19 +100,27 @@ type VideoRenderRequest struct {
 	// computePromoY() en pkg/video/engine.go — varía según cuántas líneas ocupe).
 	// Ver .agents/formato-video-reel.md y layoutFor() en pkg/video/engine.go.
 	Template string `json:"template"`
+	// VoiceText es el guion de la locución (categoría + titular + arranque de la nota),
+	// ya acotado por el frontend al tiempo del video. Si viene y ELEVENLABS_API_KEY está
+	// configurada, el Engine lo convierte en voz (ElevenLabs) y la mezcla al .mp4.
+	// Vacío = video mudo. Ver pkg/voice y applyVoiceover() en pkg/video/voiceover.go.
+	VoiceText string `json:"voice_text"`
 }
 
 // VideoJob represents an asynchronous video rendering task
 type VideoJob struct {
-	ID          string              `json:"id"`
-	Request     VideoRenderRequest  `json:"request"`
-	Status      string              `json:"status"` // "queued", "processing", "completed", "failed"
-	Progress    int                 `json:"progress"` // 0-100%
-	OutputPath  string              `json:"output_path,omitempty"`
-	OutputURL   string              `json:"output_url,omitempty"`
-	Error       string              `json:"error,omitempty"`
-	CreatedAt   time.Time           `json:"created_at"`
-	CompletedAt *time.Time          `json:"completed_at,omitempty"`
+	ID         string             `json:"id"`
+	Request    VideoRenderRequest `json:"request"`
+	Status     string             `json:"status"`   // "queued", "processing", "completed", "failed"
+	Progress   int                `json:"progress"` // 0-100%
+	OutputPath string             `json:"output_path,omitempty"`
+	OutputURL  string             `json:"output_url,omitempty"`
+	Error      string             `json:"error,omitempty"`
+	// VoiceStatus: "" (sin locución pedida), "ok", "disabled" (sin API key) o "failed: <motivo>".
+	// Un fallo de voz NO falla el render: el video se entrega mudo.
+	VoiceStatus string     `json:"voice_status,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
 }
 
 // MediaItem represents an image or stock video clip in the media bank

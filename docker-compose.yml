@@ -14,6 +14,31 @@ services:
       - ASSETS_DIR=/app/assets
       # Tamaño del worker pool que limita cuántos renders de FFmpeg corren en paralelo
       - VIDEO_RENDER_WORKERS=2
+      # URLs públicas del logo / banner en Cloudinary (banco de medios migrado).
+      # Opcionales: si están vacías, el Engine usa el archivo local en
+      # assets/logos como hasta ahora. Se descargan una sola vez al arrancar.
+      - LOGO_URL=${LOGO_URL:-}
+      - PROMO_IMAGE_URL=${PROMO_IMAGE_URL:-}
+      # Superadmin inicial: solo se siembra si data/users.json está vacío (primer arranque).
+      # Sin contraseña, el Engine genera una aleatoria y la imprime UNA vez en `docker logs`.
+      - SEED_SUPERADMIN_EMAIL=${SEED_SUPERADMIN_EMAIL:-}
+      - SEED_SUPERADMIN_PASSWORD=${SEED_SUPERADMIN_PASSWORD:-}
+      # Clave para firmar los access tokens (JWT, duran 15 min). Sin ella, el Engine genera
+      # una aleatoria al arrancar; importa sobre todo si corrés más de una instancia del
+      # Engine a la vez (deben compartir la misma clave para validar el token de la otra).
+      # Nota aparte: tanto el access como el refresh token viven solo en memoria (igual que
+      # antes de este cambio), así que un reinicio del contenedor de todos modos cierra
+      # todas las sesiones activas — fijar JWT_SECRET no evita eso, solo la vuelve estable.
+      - JWT_SECRET=${JWT_SECRET:-}
+      # Locución de los videos (ElevenLabs text-to-speech). Sin key, los videos salen mudos.
+      # El audio se cachea en data/voice_cache: el mismo texto no se paga dos veces.
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-}
+      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:-}
+      - ELEVENLABS_SPEED=${ELEVENLABS_SPEED:-}
+      - ELEVENLABS_STABILITY=${ELEVENLABS_STABILITY:-}
+      - ELEVENLABS_SIMILARITY_BOOST=${ELEVENLABS_SIMILARITY_BOOST:-}
+      - ELEVENLABS_STYLE=${ELEVENLABS_STYLE:-}
     volumes:
       - ./services/engine/data:/app/data
       - ./assets:/app/assets
@@ -24,24 +49,31 @@ services:
       context: ./apps/web
       dockerfile: Dockerfile
       args:
-        # Usado por el bundle del navegador (build-time); debe ser la URL publicada en el host
-        - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8080}
+        # Usado por el bundle del navegador (build-time); debe ser la URL publicada en el host.
+        # OJO: el servicio `engine` de abajo publica su puerto como "8081:8080" (host:contenedor),
+        # así que el navegador debe apuntar a 8081, no a 8080 (ese es el puerto interno del
+        # contenedor, inalcanzable desde el host salvo que coincida con el mapeo de `ports`).
+        - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8081}
     container_name: prensa_abierta_web
     ports:
       - "3001:3000"
     environment:
       # Usado únicamente por el bundle del navegador; en runtime del servidor NO tiene efecto
       # (Next.js incrusta NEXT_PUBLIC_* en build-time en todo el bundle, incluido el servidor)
-      - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8080}
+      - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8081}
       # Usado por el código de servidor (lib/engine.ts) en runtime real; DNS interno de docker
+      # (dentro de la red de compose, el Engine SÍ escucha en su puerto de contenedor, 8080 —
+      # esto no tiene relación con el "8081:8080" de arriba, que es solo el mapeo hacia el host)
       - ENGINE_INTERNAL_URL=http://engine:8080
       # URL por la que el Go Engine puede alcanzar a ESTE servicio (DNS interno de docker),
       # usada para construir clip_urls que el Engine descarga (ver process-news/route.ts y
       # render-video/route.ts). NO puede ser localhost: eso apuntaría al propio contenedor Engine.
-      - WEB_INTERNAL_URL=http://web:8080
-      - OLLAMA_CLOUD_BASE_URL=https://api.ollama.com/v1
+      # El contenedor `web` escucha en el puerto 3000 (ver apps/web/Dockerfile: ENV PORT=3000)
+      # — nada escucha en 8080 ahí adentro, así que NO debe ser ese puerto.
+      - WEB_INTERNAL_URL=http://web:3000
+      - OLLAMA_CLOUD_BASE_URL=https://ollama.com/v1
       - OLLAMA_CLOUD_API_KEY=${OLLAMA_CLOUD_API_KEY}
-      - OLLAMA_MODEL=qwen2.5:72b
+      - OLLAMA_MODEL=glm-5.2
       - WP_BASE_URL=${WP_BASE_URL}
       - WP_USERNAME=${WP_USERNAME}
       - WP_APPLICATION_PASSWORD=${WP_APPLICATION_PASSWORD}

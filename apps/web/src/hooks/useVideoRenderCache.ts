@@ -2,6 +2,8 @@
 
 import { useCallback, useRef, useState } from 'react';
 import type { VideoDirection } from '@/lib/videoDirection';
+import { authHeaderFresh } from '@/lib/authClient';
+import { notifyVideoUsageChanged } from '@/lib/videoUsage';
 
 export type RenderStatus = 'idle' | 'rendering' | 'ready' | 'failed';
 
@@ -16,6 +18,8 @@ export interface RenderParams {
   headline: string;
   category: string;
   imageUrl?: string;
+  // Cuerpo de la nota (HTML o texto): el Engine locuta categoría + titular + arranque de la nota.
+  body?: string;
   // Base de la composición elegida en el "Editor de video".
   background: 'image' | 'video';
   template: 'standard' | 'reels-safe' | 'app-promo';
@@ -51,6 +55,8 @@ function buildKey(p: RenderParams): string {
     p.customImageUrl || '',
     p.customClipUrl || '',
     dirSig,
+    // Si cambia la nota (ej. "Redactar de nuevo") cambia la locución: firma corta del cuerpo.
+    (p.body || '').length + ':' + (p.body || '').slice(0, 60),
   ].join('::');
 }
 
@@ -77,6 +83,10 @@ export function useVideoRenderCache() {
     statesRef.current.set(key, { status: 'rendering' });
     forceUpdate((n) => n + 1);
 
+    // El Engine cuenta el render apenas lo encola: se refresca el contador del navbar poco después
+    // de arrancar (sin esperar a que termine el render) y de nuevo al finalizar.
+    setTimeout(notifyVideoUsageChanged, 3000);
+
     (async () => {
       try {
         // Timeout defensivo del lado del cliente: el servidor ya acota su propia
@@ -85,7 +95,10 @@ export function useVideoRenderCache() {
         // fetch, en vez de cortar la conexión primero.
         const res = await fetch('/api/render-video', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          // Renueva el access token antes si está por vencer (dura 15 min) en vez de
+          // arriesgarse a un 401 en medio de un render largo — esta ruta no tiene el
+          // reintento automático que sí tiene engineRequest().
+          headers: { 'Content-Type': 'application/json', ...(await authHeaderFresh()) },
           body: JSON.stringify({
             newsId: params.newsId,
             headline: params.headline,
@@ -99,6 +112,8 @@ export function useVideoRenderCache() {
             // dirección de video (o su default de 12s).
             duration: params.duration,
             videoDirection: params.videoDirection,
+            // Solo el arranque: el guion de voz nunca usa más que unas decenas de palabras.
+            body: (params.body || '').slice(0, 2000),
           }),
           signal: AbortSignal.timeout(205_000),
         });
@@ -121,6 +136,7 @@ export function useVideoRenderCache() {
         });
       } finally {
         forceUpdate((n) => n + 1);
+        notifyVideoUsageChanged();
       }
     })();
   }, []);

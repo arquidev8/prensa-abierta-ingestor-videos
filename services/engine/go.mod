@@ -5,8 +5,10 @@ go 1.24.1
 require (
 	github.com/PuerkitoBio/goquery v1.9.2
 	github.com/gofiber/fiber/v2 v2.52.5
+	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
 	github.com/mmcdole/gofeed v1.3.0
+	golang.org/x/crypto v0.22.0
 )
 
 require (
