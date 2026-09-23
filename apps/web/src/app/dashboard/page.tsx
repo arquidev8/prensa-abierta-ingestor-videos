@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import toast from 'react-hot-toast';
 import {
   Newspaper,
@@ -42,11 +42,18 @@ import { fetchFromEngine, ENGINE_URL } from '@/lib/engineClient';
 import { inferNewsCategory } from '@/lib/newsCategorizer';
 import { useVideoRenderCache } from '@/hooks/useVideoRenderCache';
 
+const NEWS_POLL_INTERVAL_MS = 120000;
+
 export default function FeedPage() {
   const [rawNews, setRawNews] = useState<RawNews[]>([]);
   const [processedNews, setProcessedNews] = useState<ProcessedNews[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [engineError, setEngineError] = useState<string | null>(null);
+  // El polling en background nunca reemplaza las listas visibles por su cuenta
+  // (eso hacía saltar el modal/scroll mientras el usuario leía una nota). En
+  // vez de eso, guarda lo nuevo aquí y solo se aplica cuando el usuario le da
+  // click al botón "Noticias nuevas" (o en un fetch explícito del usuario).
+  const [pendingNews, setPendingNews] = useState<{ raw: RawNews[]; processed: ProcessedNews[] } | null>(null);
   const [processingId, setProcessingId] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<{ raw?: RawNews; processed?: ProcessedNews } | null>(null);
   const [autoPilot, setAutoPilot] = useState<boolean>(false);
@@ -132,13 +139,21 @@ export default function FeedPage() {
 
   const handleImportClip = async (file?: File | null) => {
     if (!file) return;
-    setUploadingMedia('video');
+    // El slot "Video de composición" también acepta una imagen: se sube y se
+    // guarda igual en `customClip` (sigue siendo la pieza del segmento de
+    // VIDEO), sin tocar la imagen de portada (`customImage`/`leadImage`), que
+    // solo cambia si el usuario elige explícitamente esa otra tarjeta. El Go
+    // Engine detecta por extensión que es una imagen y la renderiza con el
+    // mismo zoom lento (`coverImageFilter`) que usa la portada, en vez de
+    // tratarla como un clip de video.
+    const isImage = file.type.startsWith('image/');
+    setUploadingMedia(isImage ? 'image' : 'video');
     try {
-      const url = await uploadEditorFile(file, 'video');
+      const url = await uploadEditorFile(file, isImage ? 'image' : 'video');
       setCustomClip({ url, name: file.name });
       setCompBase('video');
     } catch (e: any) {
-      alert(e?.message || 'No se pudo subir el video');
+      alert(e?.message || `No se pudo subir ${isImage ? 'la imagen' : 'el video'}`);
     } finally {
       setUploadingMedia(null);
     }
@@ -161,16 +176,42 @@ export default function FeedPage() {
     toast.success('Video descargado correctamente.');
   };
 
-  const fetchNews = async () => {
-    setLoading(true);
+  // Referencias siempre-actuales para poder comparar contra lo nuevo sin que
+  // el closure de fetchNews quede con el estado "stale" de cuando se creó.
+  const rawNewsRef = useRef<RawNews[]>(rawNews);
+  const processedNewsRef = useRef<ProcessedNews[]>(processedNews);
+  useEffect(() => { rawNewsRef.current = rawNews; }, [rawNews]);
+  useEffect(() => { processedNewsRef.current = processedNews; }, [processedNews]);
+  const isModalOpenRef = useRef<boolean>(false);
+  useEffect(() => { isModalOpenRef.current = selectedItem !== null; }, [selectedItem]);
+  const idsKey = (items: Array<{ id: string }>) => items.map((i) => i.id).sort().join(',');
+
+  // background=true (usado por el polling automático) nunca pisa lo que el
+  // usuario está viendo: si hay noticias nuevas/distintas las deja en
+  // `pendingNews` para que el botón "Noticias nuevas" las aplique.
+  const fetchNews = async (background = false) => {
+    if (!background) setLoading(true);
 
     const [rawResult, procResult] = await Promise.all([
       fetchFromEngine<{ items: RawNews[] }>('/api/news/raw', { cache: 'no-store' }),
       fetchFromEngine<{ items: ProcessedNews[] }>('/api/news/processed', { cache: 'no-store' }),
     ]);
 
-    if (rawResult.ok) setRawNews(rawResult.data.items || []);
-    if (procResult.ok) setProcessedNews(procResult.data.items || []);
+    const nextRaw = rawResult.ok ? rawResult.data.items || [] : null;
+    const nextProc = procResult.ok ? procResult.data.items || [] : null;
+
+    if (background) {
+      if (nextRaw && nextProc) {
+        const changed =
+          idsKey(nextRaw) !== idsKey(rawNewsRef.current) ||
+          idsKey(nextProc) !== idsKey(processedNewsRef.current);
+        if (changed) setPendingNews({ raw: nextRaw, processed: nextProc });
+      }
+    } else {
+      if (nextRaw) setRawNews(nextRaw);
+      if (nextProc) setProcessedNews(nextProc);
+      setPendingNews(null);
+    }
 
     // Solo mostramos el banner de "Engine no disponible" cuando el Engine es
     // inalcanzable (fetch falló), no ante un simple error HTTP puntual.
@@ -179,14 +220,21 @@ export default function FeedPage() {
       : !procResult.ok && procResult.offline
         ? procResult
         : null;
-    setEngineError(offlineResult ? offlineResult.error : null);
+    if (!background) setEngineError(offlineResult ? offlineResult.error : null);
 
-    setLoading(false);
+    if (!background) setLoading(false);
+  };
+
+  const applyPendingNews = () => {
+    if (!pendingNews) return;
+    setRawNews(pendingNews.raw);
+    setProcessedNews(pendingNews.processed);
+    setPendingNews(null);
   };
 
   useEffect(() => {
     fetchNews();
-    const interval = setInterval(fetchNews, 20000);
+    const interval = setInterval(() => fetchNews(true), NEWS_POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, []);
 
@@ -196,7 +244,9 @@ export default function FeedPage() {
       if (!res.ok) {
         throw new Error(`No se pudo iniciar el sondeo (${res.status})`);
       }
-      setTimeout(fetchNews, 2000);
+      // Con el modal abierto el resultado queda pendiente (botón "Noticias nuevas");
+      // se lee el ref al disparar el timeout porque el modal pudo abrirse en esos 2s.
+      setTimeout(() => fetchNews(isModalOpenRef.current), 2000);
     } catch (e) {
       console.error(e);
     }
@@ -230,7 +280,7 @@ export default function FeedPage() {
       });
       const data = await res.json();
       if (data.success && data.processed) {
-        await fetchNews();
+        await fetchNews(true);
         openModal({ raw: item, processed: data.processed });
       } else {
         alert(data.error || 'No se pudo completar la redacción. Por favor intenta de nuevo.');
@@ -417,7 +467,7 @@ export default function FeedPage() {
       });
       setSelectedItem({ ...selectedItem, processed: updated });
       setEditing(false);
-      fetchNews();
+      fetchNews(true);
     } catch (err) {
       console.error('Error guardando cambios:', err);
     }
@@ -493,12 +543,25 @@ export default function FeedPage() {
             <RefreshCw className="w-3.5 h-3.5" />
             <span>Sondear Diarios</span>
           </button>
+
+          {/* Aparece solo cuando el polling en background detectó noticias
+              nuevas/distintas: el usuario decide cuándo refrescar la lista
+              en vez de que salte sola (p.ej. mientras lee una nota). */}
+          {pendingNews && (
+            <button
+              onClick={applyPendingNews}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-black shadow-md shadow-emerald-500/20 transition active:scale-95 animate-pulse"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Noticias nuevas — Actualizar</span>
+            </button>
+          )}
         </div>
       </div>
 
       {/* Estado explícito cuando el Go Engine no responde (evita confundirlo con "sin noticias") */}
       {engineError && (
-        <EngineOfflineBanner message={engineError} onRetry={fetchNews} retrying={loading} />
+        <EngineOfflineBanner message={engineError} onRetry={() => fetchNews()} retrying={loading} />
       )}
 
       {/* Advanced Filter Suite (Clean Light Mesh Aesthetics) */}
@@ -1334,23 +1397,30 @@ export default function FeedPage() {
                             <div className="space-y-2">
                               <label
                                 className={`flex w-fit items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-bold text-white transition ${
-                                  uploadingMedia === 'video'
+                                  uploadingMedia === 'video' || uploadingMedia === 'image'
                                     ? 'bg-slate-400 cursor-not-allowed'
                                     : 'bg-[#FF5500] hover:bg-[#E04B00] cursor-pointer'
                                 }`}
                               >
                                 <Upload className="w-3.5 h-3.5" />
-                                {uploadingMedia === 'video' ? 'Subiendo video...' : 'Importar video'}
+                                {uploadingMedia === 'video'
+                                  ? 'Subiendo video...'
+                                  : uploadingMedia === 'image'
+                                    ? 'Subiendo imagen...'
+                                    : 'Importar video'}
                                 <input
                                   type="file"
-                                  accept="video/*"
+                                  accept="video/*,image/*"
                                   className="hidden"
-                                  disabled={uploadingMedia === 'video'}
+                                  disabled={uploadingMedia === 'video' || uploadingMedia === 'image'}
                                   onChange={(e) => handleImportClip(e.target.files?.[0])}
                                 />
                               </label>
                               <p className="text-[10px] text-slate-400">
                                 Tamaño usado en la composición: <strong className="font-mono font-bold text-slate-500">1080 × 1920 px</strong> (9:16, vertical). Sube un clip lo más cercano posible a esa proporción para evitar recortes.
+                              </p>
+                              <p className="text-[10px] italic text-slate-400">
+                                (también se puede cambiar el video por una imagen)
                               </p>
                               {customClip && (
                                 <button
