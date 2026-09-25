@@ -51,14 +51,18 @@ export interface CategoryFolder {
   images: MediaFile[];
 }
 
-// Resuelve la ruta absoluta al directorio assets/contenido
-export function getAssetsContenidoDir(): string {
+// Resuelve la ruta base al directorio de assets (compatible con Docker, runtime local y standalone Next.js)
+export function getAssetsBaseDir(): string {
+  if (process.env.ASSETS_DIR && fs.existsSync(process.env.ASSETS_DIR)) {
+    return process.env.ASSETS_DIR;
+  }
   const possiblePaths = [
-    path.resolve(process.cwd(), 'assets', 'contenido'),
-    path.resolve(process.cwd(), '..', '..', 'assets', 'contenido'),
-    path.resolve(process.cwd(), '..', 'assets', 'contenido'),
-    path.resolve(process.cwd(), 'public', 'assets', 'contenido'),
-  ];
+    process.env.ASSETS_DIR,
+    path.resolve(process.cwd(), 'assets'),
+    path.resolve(process.cwd(), '..', '..', 'assets'),
+    path.resolve(process.cwd(), '..', 'assets'),
+    path.resolve(process.cwd(), 'public', 'assets'),
+  ].filter(Boolean) as string[];
 
   for (const p of possiblePaths) {
     if (fs.existsSync(p)) {
@@ -66,8 +70,19 @@ export function getAssetsContenidoDir(): string {
     }
   }
 
-  // Fallback por defecto
-  return path.resolve(process.cwd(), '../../assets/contenido');
+  // Si estamos dentro del contenedor Docker (/app), assets está montado en /app/assets
+  if (process.cwd() === '/app' || process.cwd().startsWith('/app')) {
+    return '/app/assets';
+  }
+
+  // Fallback seguro relativo al proceso
+  return path.resolve(process.cwd(), 'assets');
+}
+
+// Resuelve la ruta absoluta al directorio assets/contenido
+export function getAssetsContenidoDir(): string {
+  const base = getAssetsBaseDir();
+  return path.join(base, 'contenido');
 }
 
 // Resuelve la ruta absoluta a assets/uploads (archivos importados por el usuario
@@ -83,7 +98,8 @@ export function getAssetsContenidoDir(): string {
 // hasta reconstruir la imagen. Por eso se sirven vía un route handler dinámico
 // (`/api/media/uploads/[filename]`), que sí lee el disco en cada request.
 export function getAssetsUploadsDir(): string {
-  return path.join(path.dirname(getAssetsContenidoDir()), 'uploads');
+  const base = getAssetsBaseDir();
+  return path.join(base, 'uploads');
 }
 
 // Normaliza texto eliminando acentos y caracteres especiales para comparaciones
