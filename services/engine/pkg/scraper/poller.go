@@ -27,7 +27,9 @@ type Poller struct {
 	seenHashes map[string]bool
 	seenLinks  map[string]bool // models.LinkKey: medio + link normalizado
 	images     *ImageResolver
-	mu         sync.RWMutex
+	// feedRetryDelays son las esperas entre reintentos ante un 429/503 (ver feedfetch.go).
+	feedRetryDelays []time.Duration
+	mu              sync.RWMutex
 	onNewNews  OnNewNewsCallback
 	stopChan   chan struct{}
 	isRunning  bool
@@ -46,6 +48,7 @@ func NewPoller(sources []models.Source, callback OnNewNewsCallback) *Poller {
 		seenHashes: make(map[string]bool),
 		seenLinks:  make(map[string]bool),
 		images:     NewImageResolver(),
+		feedRetryDelays: defaultFeedRetryDelays,
 		onNewNews:  callback,
 		stopChan:   make(chan struct{}),
 	}
@@ -204,7 +207,7 @@ func (p *Poller) FetchAllNow() []*models.RawNews {
 
 func (p *Poller) fetchFeed(src models.Source) []*models.RawNews {
 	log.Printf("[Poller] Consultando feed: %s (%s)", src.Name, src.RSSURL)
-	feed, err := p.feedParser.ParseURL(src.RSSURL)
+	feed, err := p.fetchAndParse(src)
 	if err != nil {
 		log.Printf("[Poller ERROR] Error al parsear RSS de %s: %v", src.Name, err)
 		return nil

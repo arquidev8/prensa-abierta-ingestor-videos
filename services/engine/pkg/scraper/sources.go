@@ -40,7 +40,11 @@ func GetDefaultPRSources() []models.Source {
 			ID:          "el-vocero",
 			Name:        "El Vocero de Puerto Rico",
 			BaseURL:     "https://www.elvocero.com",
-			RSSURL:      "https://www.elvocero.com/search/?f=rss&t=article&c=noticias*&l=50&s=start_time&sd=desc",
+			// Sin filtro de sección a propósito: `c=noticias*` no coincide con ninguna sección
+			// (las reales son actualidad, gobierno, ley-y-orden...) y, además, una URL que casi
+			// nadie más pide no está en el caché del CDN de TownNews y el servidor de origen la
+			// limita con 429. Esta es la URL estándar de sus lectores de RSS: sale de caché.
+			RSSURL:      "https://www.elvocero.com/search/?f=rss&t=article&l=50&s=start_time&sd=desc",
 			Category:    "General",
 			Enabled:     true,
 			PollMinutes: 5,
