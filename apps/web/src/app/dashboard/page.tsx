@@ -37,12 +37,34 @@ import { RawNews, ProcessedNews } from '@/lib/types';
 import VideoPlayerPreview from '@/components/VideoPlayerPreview';
 import ArticleComparison, { LegalAuditBanner, ArticleBody } from '@/components/ArticleComparison';
 import EngineOfflineBanner from '@/components/EngineOfflineBanner';
+import RelatedCoverageRow from '@/components/RelatedCoverageRow';
+import RelatedCoverageStack from '@/components/RelatedCoverageStack';
+import CardImage from '@/components/CardImage';
 import { calculateViralTrendScore } from '@/lib/trends';
 import { fetchFromEngine, ENGINE_URL } from '@/lib/engineClient';
 import { inferNewsCategory } from '@/lib/newsCategorizer';
 import { useVideoRenderCache } from '@/hooks/useVideoRenderCache';
 
 const NEWS_POLL_INTERVAL_MS = 120000;
+
+// Cards de la página cuyas imágenes se piden al abrirla (dos filas de la grilla de 3
+// columnas); el resto carga al acercarse el scroll.
+const EAGER_IMAGE_CARDS = 6;
+
+// Debe coincidir con los `id` de services/engine/pkg/scraper/sources.go.
+const NEWS_SOURCE_FILTER_OPTIONS = [
+  { id: 'all', label: 'Todos los Diarios' },
+  { id: 'el-nuevo-dia', label: 'El Nuevo Día' },
+  { id: 'primera-hora', label: 'Primera Hora' },
+  { id: 'el-vocero', label: 'El Vocero' },
+  { id: 'noticel', label: 'NotiCel' },
+  { id: 'metro-pr', label: 'Metro PR' },
+  { id: 'la-perla-del-sur', label: 'La Perla del Sur' },
+  { id: 'telemundo-pr', label: 'Telemundo PR' },
+  { id: 'wapa', label: 'WAPA' },
+  { id: 'radio-isla', label: 'Radio Isla 1320' },
+  { id: 'el-calce', label: 'El Calce' },
+];
 
 export default function FeedPage() {
   const [rawNews, setRawNews] = useState<RawNews[]>([]);
@@ -498,7 +520,7 @@ export default function FeedPage() {
             Monitoreo, Redacción IA & Video Vertical
           </h1>
           <p className="text-xs sm:text-sm text-slate-500 max-w-xl">
-            Ingestión en tiempo real de <strong>El Nuevo Día, Primera Hora, El Vocero, NotiCel y Metro PR</strong> para producción autónoma.
+            Ingestión en tiempo real de <strong>10 medios de Puerto Rico</strong> (El Nuevo Día, Primera Hora, El Vocero, NotiCel, Metro PR, La Perla del Sur, Telemundo PR, WAPA, Radio Isla y El Calce) para producción autónoma.
           </p>
         </div>
 
@@ -621,31 +643,22 @@ export default function FeedPage() {
 
         {/* Row 2: Newspaper Source Filter + Status Tab */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-100">
-          {/* Source Filter */}
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
-            <span className="text-xs font-bold text-slate-500 flex items-center gap-1.5 mr-1">
-              <Filter className="w-3.5 h-3.5" /> Fuente:
-            </span>
-            {[
-              { id: 'all', label: 'Todos los Diarios' },
-              { id: 'el-nuevo-dia', label: 'El Nuevo Día' },
-              { id: 'primera-hora', label: 'Primera Hora' },
-              { id: 'el-vocero', label: 'El Vocero' },
-              { id: 'noticel', label: 'NotiCel' },
-              { id: 'metro-pr', label: 'Metro PR' },
-            ].map((src) => (
-              <button
-                key={src.id}
-                onClick={() => setSelectedSource(src.id)}
-                className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition whitespace-nowrap ${
-                  selectedSource === src.id
-                    ? 'bg-[#FF5500] text-white shadow-sm shadow-orange-500/20'
-                    : 'bg-slate-50 text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-slate-200/80'
-                }`}
-              >
-                {src.label}
-              </button>
-            ))}
+          {/* Source Filter: dropdown (mismo criterio que Categoría) — con 10 medios una
+              fila de botones forzaba scroll horizontal. */}
+          <div className="flex items-center gap-2 bg-slate-50 px-3.5 py-2 rounded-2xl border border-slate-200 text-xs shrink-0">
+            <Filter className="w-3.5 h-3.5 text-slate-500" />
+            <span className="text-slate-600 font-bold">Fuente:</span>
+            <select
+              value={selectedSource}
+              onChange={(e) => setSelectedSource(e.target.value)}
+              className="bg-transparent font-bold text-slate-800 focus:outline-none cursor-pointer"
+            >
+              {NEWS_SOURCE_FILTER_OPTIONS.map((src) => (
+                <option key={src.id} value={src.id}>
+                  {src.label}
+                </option>
+              ))}
+            </select>
           </div>
 
           {/* Category Filter: dropdown en vez de pills — con 8+ categorías inferidas,
@@ -705,7 +718,7 @@ export default function FeedPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {paginatedNews.map((item) => {
+          {paginatedNews.map((item, index) => {
             const isProcessing = processingId === item.id;
             const proc = processedNews.find((p) => p.raw_news_id === item.id);
             const trend = calculateViralTrendScore(item);
@@ -718,17 +731,12 @@ export default function FeedPage() {
                 <div>
                   {/* Card Header & Image */}
                   <div className="relative h-48 w-full bg-slate-100 overflow-hidden">
-                    {item.image_url ? (
-                      <img
-                        src={item.image_url}
-                        alt={item.title}
-                        className="w-full h-full object-cover group-hover:scale-105 transition duration-500"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-slate-100 to-slate-200 text-slate-400">
-                        <Newspaper className="w-12 h-12 stroke-[1.2]" />
-                      </div>
-                    )}
+                    <CardImage
+                      src={item.image_url}
+                      alt={item.title}
+                      eager={index < EAGER_IMAGE_CARDS}
+                      className="w-full h-full object-cover group-hover:scale-105 transition duration-500"
+                    />
                     <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-black/30 pointer-events-none" />
 
                     {/* Source Badge & Trending Pill */}
@@ -766,11 +774,12 @@ export default function FeedPage() {
                     <p className="text-xs text-slate-600 line-clamp-3 leading-relaxed">
                       {item.summary || item.content}
                     </p>
+                    <RelatedCoverageStack sources={item.related_sources} />
                   </div>
                 </div>
 
                 {/* Card Actions Footer */}
-                <div className="p-5 pt-0 border-t border-slate-100 mt-2 flex items-center justify-between gap-2">
+                <div className="p-5 border-t border-slate-100 mt-2 flex items-center justify-between gap-2">
                   <a
                     href={item.original_url}
                     target="_blank"
@@ -1060,6 +1069,9 @@ export default function FeedPage() {
                             rewrittenContent={displayBody}
                           />
                         )}
+
+                        {/* 3.5 · También lo publicaron (otros medios de los 5 scrapeados) */}
+                        <RelatedCoverageRow sources={raw?.related_sources} />
                       </>
                     )}
 

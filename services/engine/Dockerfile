@@ -1,5 +1,7 @@
 # --- Etapa 1: Build ---
-FROM golang:1.24 AS builder
+# Go 1.25 o superior: con Go 1.24 el cliente HTTP del Engine es tomado por bot y Cloudflare
+# responde 403 ("Just a moment") a las páginas y a la API REST de La Perla del Sur.
+FROM golang:1.25 AS builder
 WORKDIR /app
 
 COPY go.mod go.sum ./

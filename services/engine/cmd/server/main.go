@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +20,8 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/prensa-abierta/ingestor-engine/pkg/auth"
+	"github.com/prensa-abierta/ingestor-engine/pkg/db"
+	"github.com/prensa-abierta/ingestor-engine/pkg/matcher"
 	"github.com/prensa-abierta/ingestor-engine/pkg/models"
 	"github.com/prensa-abierta/ingestor-engine/pkg/scraper"
 	"github.com/prensa-abierta/ingestor-engine/pkg/storage"
@@ -46,29 +51,33 @@ func main() {
 	// Initialize Store
 	store := storage.NewStore(dataDir)
 
-	// Initialize User Store (usuarios/roles + límite diario de video, archivo
-	// separado users.json). Si no hay ningún usuario todavía (primer arranque),
-	// se siembra un superadmin para no quedar sin forma de administrar el panel.
-	userStore := storage.NewUserStore(dataDir)
-	if len(userStore.GetAllUsers()) == 0 {
-		seedEmail := os.Getenv("SEED_SUPERADMIN_EMAIL")
-		if seedEmail == "" {
-			seedEmail = "admin@prensaabierta.com"
-		}
-		seedPassword := os.Getenv("SEED_SUPERADMIN_PASSWORD")
-		generated := seedPassword == ""
-		if generated {
-			seedPassword = randomPassword()
-		}
-		seedUser, err := userStore.CreateUser("Superadmin", seedEmail, seedPassword, models.RoleSuperAdmin)
-		if err != nil {
-			log.Printf("[UserStore] No se pudo sembrar el superadmin inicial: %v", err)
-		} else if generated {
-			log.Printf("[UserStore] Superadmin inicial creado: email=%s password=%s (generada, cambiarla apenas se inicie sesión; login vía POST /api/auth/login)", seedUser.Email, seedPassword)
-		} else {
-			log.Printf("[UserStore] Superadmin inicial creado: email=%s (password de SEED_SUPERADMIN_PASSWORD; login vía POST /api/auth/login)", seedUser.Email)
-		}
+	// Usuarios, roles y contador diario de videos viven en PostgreSQL. Las migraciones de esquema
+	// (pkg/db/migrations) se aplican solas al arrancar, así que un deploy deja la base al día.
+	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if databaseURL == "" {
+		log.Fatal("[DB] Falta DATABASE_URL (ej. postgres://usuario:clave@host:5432/base?sslmode=disable): usuarios y roles se guardan en PostgreSQL")
 	}
+	usageTZ := strings.TrimSpace(os.Getenv("USAGE_TIMEZONE"))
+	if usageTZ == "" {
+		usageTZ = "America/Puerto_Rico" // el "día" del límite de videos cambia a medianoche de Puerto Rico
+	}
+
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 2*time.Minute)
+	pool, err := db.Connect(startupCtx, databaseURL)
+	if err != nil {
+		log.Fatalf("[DB] %v", err)
+	}
+	if err := db.Migrate(databaseURL); err != nil {
+		log.Fatalf("[DB] %v", err)
+	}
+	userStore, err := storage.NewUserStore(startupCtx, pool, usageTZ)
+	if err != nil {
+		log.Fatalf("[DB] %v", err)
+	}
+	if err := seedInitialUsers(startupCtx, userStore, dataDir); err != nil {
+		log.Fatalf("[UserStore] %v", err)
+	}
+	cancelStartup()
 
 	// Emisor de access tokens (JWT, 15 min) usado por login/refresh/requireAuth
 	// más abajo. El refresh token (opaco, 5 días) sigue viviendo en userStore.
@@ -112,10 +121,80 @@ func main() {
 
 	// Initialize Scraper Poller for Puerto Rico
 	sources := scraper.GetDefaultPRSources()
+
+	sourceLogoByID := make(map[string]string, len(sources))
+	for _, src := range sources {
+		sourceLogoByID[src.ID] = src.LogoURL
+	}
+
+	// Matcher: detecta, entre estas mismas 5 fuentes, qué noticias cubren el
+	// mismo evento (RawNews.RelatedSources). Umbral y ventana ajustables por env
+	// sin recompilar, mientras se afina con datos reales.
+	matcherCfg := matcher.DefaultConfig()
+	if raw := os.Getenv("RELATED_NEWS_SIMILARITY_THRESHOLD"); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v > 0 && v <= 1 {
+			matcherCfg.Threshold = v
+		} else {
+			log.Printf("[Warning] RELATED_NEWS_SIMILARITY_THRESHOLD inválido ('%s'), usando default %.2f", raw, matcherCfg.Threshold)
+		}
+	}
+	if raw := os.Getenv("RELATED_NEWS_WINDOW_HOURS"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			matcherCfg.WindowHours = v
+		} else {
+			log.Printf("[Warning] RELATED_NEWS_WINDOW_HOURS inválido ('%s'), usando default %d", raw, matcherCfg.WindowHours)
+		}
+	}
+
+	// ingestRawNews es el único punto de entrada de una noticia cruda al store:
+	// la guarda y de inmediato busca (y enlaza en ambos sentidos) coincidencias
+	// con lo ya ingerido de las OTRAS fuentes. La usan tanto el poller continuo
+	// como el sondeo manual (/api/news/poll), para que el matching nunca se
+	// desalinee entre esos dos caminos.
+	ingestRawNews := func(item *models.RawNews) {
+		store.SaveRawNews(item)
+		pool := store.GetAllRawNewsDeduped() // sin copias: no se compara ni se enlaza contra duplicados
+		for _, m := range matcher.FindMatches(item, pool, matcherCfg, sourceLogoByID) {
+			store.AppendRelatedSource(item.ID, m.Related, matcherCfg.MaxMatches)
+			store.AppendRelatedSource(m.CandidateID, matcher.RelatedSourceFor(item, m.Related.Similarity, sourceLogoByID), matcherCfg.MaxMatches)
+		}
+	}
+
+	// Migración única de datos ya guardados: algunos medios (ej. Telemundo PR) mandaban
+	// el artículo completo como HTML en el resumen y quedó con etiquetas <p> literales.
+	// Idempotente: solo toca resúmenes que todavía traen HTML.
+	if n := store.MutateAllRawNews(scraper.SanitizeRawNewsSummary); n > 0 {
+		log.Printf("[Store] %d resúmenes con HTML limpiados (texto plano)", n)
+	}
+
+	// Backfill único: enlaza entre sí lo que ya estaba en db.json antes de que
+	// este matcher existiera. Corre una sola vez en segundo plano, no bloquea
+	// el arranque del servidor.
+	go matcher.BackfillAll(store, matcherCfg, sourceLogoByID)
+
 	poller := scraper.NewPoller(sources, func(news *models.RawNews) {
-		store.SaveRawNews(news)
+		ingestRawNews(news)
 		log.Printf("[Ingestor PR] 📰 Nueva noticia guardada: [%s] %s", news.SourceName, news.Title)
 	})
+
+	// Sembrar los hashes ya guardados: sin esto, cada reinicio re-ingería todo lo que traen
+	// los feeds con IDs nuevos (63% de lo guardado eran copias) y repetía el pedido de
+	// og:image de cada nota sin imagen.
+	// También se siembra el link normalizado: así una nota que el medio re-publica con el
+	// titular editado tampoco entra como noticia nueva.
+	poller.MarkSeenNews(store.GetAllRawNews())
+
+	// Completar en segundo plano las notas YA guardadas sin imagen (La Perla del Sur, WAPA):
+	// como quedaron sembradas arriba, el poller no las vuelve a ingerir.
+	go func() {
+		attempted, recovered := poller.BackfillImages(store, time.Time{})
+		if attempted > 0 {
+			log.Printf("[Images] Backfill: %d de %d notas guardadas sin imagen recuperaron su imagen", recovered, attempted)
+		}
+	}()
+	// Y reintentar cada 20 min las de las últimas 24 h que sigan sin imagen (un 429 o un
+	// timeout en el pedido inicial no debe dejarlas sin foto para siempre).
+	poller.StartImageRetryLoop(store, 20*time.Minute, 24*time.Hour)
 
 	// Start continuous background poller (detenido explícitamente en el shutdown ordenado más abajo)
 	poller.Start()
@@ -153,7 +232,9 @@ func main() {
 	})
 
 	app.Get("/api/news/raw", func(c *fiber.Ctx) error {
-		items := store.GetAllRawNews()
+		// Una noticia por medio+link: el store guarda copias viejas (de reinicios del Engine)
+		// y versiones con el titular editado que no deben verse como cards repetidas.
+		items := store.GetAllRawNewsDeduped()
 		return c.JSON(fiber.Map{
 			"total": len(items),
 			"items": items,
@@ -173,7 +254,7 @@ func main() {
 		go func() {
 			items := poller.FetchAllNow()
 			for _, item := range items {
-				store.SaveRawNews(item)
+				ingestRawNews(item)
 			}
 		}()
 		return c.JSON(fiber.Map{
@@ -202,6 +283,26 @@ func main() {
 		return c.Status(201).JSON(item)
 	})
 
+	// internalError registra la falla real (una sola vez, acá) y responde un 500 genérico: el detalle
+	// de la base no debe llegar al cliente.
+	internalError := func(c *fiber.Ctx, err error) error {
+		log.Printf("[API] %s %s: %v", c.Method(), c.Path(), err)
+		return c.Status(500).JSON(fiber.Map{"error": "Error interno del servidor"})
+	}
+
+	// userError traduce los errores del UserStore: datos inválidos → 400, inexistente → 404, resto → 500.
+	userError := func(c *fiber.Ctx, err error) error {
+		var input storage.InputError
+		switch {
+		case errors.As(err, &input):
+			return c.Status(400).JSON(fiber.Map{"error": input.Error()})
+		case errors.Is(err, storage.ErrUserNotFound):
+			return c.Status(404).JSON(fiber.Map{"error": "Usuario no encontrado"})
+		default:
+			return internalError(c, err)
+		}
+	}
+
 	// requireAuth resuelve "Authorization: Bearer <access token JWT>" a un
 	// usuario y lo deja en c.Locals("authUser") para que el handler no tenga
 	// que repetir el parseo. El JWT solo prueba QUIÉN es (subject) — el rol y
@@ -221,9 +322,12 @@ func main() {
 		if err != nil {
 			return c.Status(401).JSON(fiber.Map{"error": "Token inválido o expirado"})
 		}
-		user, ok := userStore.GetUser(userID)
-		if !ok {
+		user, err := userStore.GetUser(c.UserContext(), userID)
+		if errors.Is(err, storage.ErrUserNotFound) {
 			return c.Status(401).JSON(fiber.Map{"error": "El usuario de este token ya no existe"})
+		}
+		if err != nil {
+			return internalError(c, err)
 		}
 		if !user.Active {
 			return c.Status(401).JSON(fiber.Map{"error": "Usuario inactivo"})
@@ -264,9 +368,12 @@ func main() {
 		if err := c.BodyParser(&body); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 		}
-		user, err := userStore.VerifyCredentials(body.Email, body.Password)
-		if err != nil {
+		user, err := userStore.VerifyCredentials(c.UserContext(), body.Email, body.Password)
+		if errors.Is(err, storage.ErrInvalidCredentials) || errors.Is(err, storage.ErrUserInactive) {
 			return c.Status(401).JSON(fiber.Map{"error": err.Error()})
+		}
+		if err != nil {
+			return internalError(c, err)
 		}
 		pair, err := issueTokenPair(user)
 		if err != nil {
@@ -287,9 +394,12 @@ func main() {
 		if err := c.BodyParser(&body); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 		}
-		rotated, user, err := userStore.RotateRefreshToken(body.RefreshToken)
-		if err != nil {
+		rotated, user, err := userStore.RotateRefreshToken(c.UserContext(), body.RefreshToken)
+		if errors.Is(err, storage.ErrInvalidRefreshToken) || errors.Is(err, storage.ErrUserNotFound) {
 			return c.Status(401).JSON(fiber.Map{"error": "Sesión vencida, iniciá sesión de nuevo"})
+		}
+		if err != nil {
+			return internalError(c, err)
 		}
 		if !user.Active {
 			// El refresh token ya se invalidó (RotateRefreshToken es de un solo uso),
@@ -324,7 +434,10 @@ func main() {
 
 	// User & Role Endpoints
 	app.Get("/api/users", func(c *fiber.Ctx) error {
-		all := userStore.GetAllUsers()
+		all, err := userStore.GetAllUsers(c.UserContext())
+		if err != nil {
+			return internalError(c, err)
+		}
 		items := make([]models.User, 0, len(all))
 		for _, u := range all {
 			items = append(items, u.Public())
@@ -351,17 +464,17 @@ func main() {
 		if !models.CanRegisterRole(caller.Role, body.Role) {
 			return c.Status(403).JSON(fiber.Map{"error": fmt.Sprintf("El rol %s no puede registrar usuarios con rol %s", caller.Role, body.Role)})
 		}
-		user, err := userStore.CreateUser(body.Name, body.Email, body.Password, body.Role)
+		user, err := userStore.CreateUser(c.UserContext(), body.Name, body.Email, body.Password, body.Role)
 		if err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+			return userError(c, err)
 		}
 		return c.Status(201).JSON(user.Public())
 	})
 
 	app.Get("/api/users/:id", func(c *fiber.Ctx) error {
-		user, ok := userStore.GetUser(c.Params("id"))
-		if !ok {
-			return c.Status(404).JSON(fiber.Map{"error": "Usuario no encontrado"})
+		user, err := userStore.GetUser(c.UserContext(), c.Params("id"))
+		if err != nil {
+			return userError(c, err)
 		}
 		return c.JSON(user.Public())
 	})
@@ -374,9 +487,9 @@ func main() {
 	app.Put("/api/users/:id", requireAuth, func(c *fiber.Ctx) error {
 		caller := c.Locals("authUser").(*models.User)
 		targetID := c.Params("id")
-		target, ok := userStore.GetUser(targetID)
-		if !ok {
-			return c.Status(404).JSON(fiber.Map{"error": "Usuario no encontrado"})
+		target, err := userStore.GetUser(c.UserContext(), targetID)
+		if err != nil {
+			return userError(c, err)
 		}
 
 		isSelf := caller.ID == target.ID
@@ -434,7 +547,7 @@ func main() {
 			}
 		}
 
-		updated, err := userStore.UpdateUser(targetID, storage.UserUpdate{
+		updated, err := userStore.UpdateUser(c.UserContext(), targetID, storage.UserUpdate{
 			Name:                         body.Name,
 			Email:                        body.Email,
 			Password:                     body.Password,
@@ -444,7 +557,7 @@ func main() {
 			ClearDailyVideoLimitOverride: body.ClearDailyVideoLimitOverride,
 		})
 		if err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+			return userError(c, err)
 		}
 		return c.JSON(updated.Public())
 	})
@@ -456,9 +569,9 @@ func main() {
 	app.Delete("/api/users/:id", requireAuth, func(c *fiber.Ctx) error {
 		caller := c.Locals("authUser").(*models.User)
 		targetID := c.Params("id")
-		target, ok := userStore.GetUser(targetID)
-		if !ok {
-			return c.Status(404).JSON(fiber.Map{"error": "Usuario no encontrado"})
+		target, err := userStore.GetUser(c.UserContext(), targetID)
+		if err != nil {
+			return userError(c, err)
 		}
 		if caller.ID == target.ID {
 			return c.Status(400).JSON(fiber.Map{"error": "No podés eliminar tu propia cuenta"})
@@ -466,16 +579,21 @@ func main() {
 		if !models.CanManageUser(caller.Role, target.Role) {
 			return c.Status(403).JSON(fiber.Map{"error": "No tenés permiso para eliminar este usuario"})
 		}
-		userStore.DeleteUser(targetID)
+		if _, err := userStore.DeleteUser(c.UserContext(), targetID); err != nil {
+			return internalError(c, err)
+		}
 		return c.SendStatus(204)
 	})
 
 	app.Get("/api/users/:id/video-usage", func(c *fiber.Ctx) error {
-		user, ok := userStore.GetUser(c.Params("id"))
-		if !ok {
-			return c.Status(404).JSON(fiber.Map{"error": "Usuario no encontrado"})
+		user, err := userStore.GetUser(c.UserContext(), c.Params("id"))
+		if err != nil {
+			return userError(c, err)
 		}
-		_, limit, used := userStore.CanGenerateVideo(user)
+		limit, used, err := userStore.VideoQuota(c.UserContext(), user)
+		if err != nil {
+			return internalError(c, err)
+		}
 		return c.JSON(fiber.Map{"user_id": user.ID, "role": user.Role, "limit": limit, "used_today": used})
 	})
 
@@ -492,7 +610,17 @@ func main() {
 		if !user.Active {
 			return c.Status(403).JSON(fiber.Map{"error": "Usuario inactivo"})
 		}
-		allowed, limit, used := userStore.CanGenerateVideo(user)
+		var req models.VideoRenderRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		// La cuota se reserva de forma atómica en la base (dos pedidos simultáneos no pueden pasarse
+		// del tope) y se devuelve si el render finalmente no se encola.
+		allowed, limit, used, err := userStore.ReserveVideoUsage(c.UserContext(), user)
+		if err != nil {
+			return internalError(c, err)
+		}
 		if !allowed {
 			return c.Status(429).JSON(fiber.Map{
 				"error": fmt.Sprintf("Límite diario de %d videos alcanzado para el rol %s", limit, user.Role),
@@ -501,32 +629,26 @@ func main() {
 			})
 		}
 
-		var req models.VideoRenderRequest
-		if err := c.BodyParser(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
-		}
-
 		job := videoEngine.CreateJob(req)
 
 		// Encolar el render para que lo procese el worker pool (limita cuántos
 		// FFmpeg corren en paralelo). Si la cola está llena, se rechaza con 503
 		// en vez de acumular trabajo ilimitado o tumbar el servidor.
 		if err := videoEngine.Enqueue(job.ID); err != nil {
+			if relErr := userStore.ReleaseVideoUsage(c.UserContext(), user.ID); relErr != nil {
+				log.Printf("[API] no se pudo liberar la cuota de video de %s: %v", user.ID, relErr)
+			}
 			return c.Status(503).JSON(fiber.Map{
 				"error":  err.Error(),
 				"job_id": job.ID,
 			})
 		}
 
-		// Solo se cuenta contra el límite diario un render que efectivamente
-		// se encoló (no un 503 por cola llena ni un 400 de validación previo).
-		newUsage := userStore.IncrementVideoUsage(user.ID)
-
 		return c.Status(202).JSON(fiber.Map{
 			"message":     "Trabajo de renderizado de video encolado",
 			"job_id":      job.ID,
 			"job":         job,
-			"video_usage": newUsage,
+			"video_usage": used,
 			"video_limit": limit,
 		})
 	})
@@ -586,9 +708,53 @@ func main() {
 	}
 
 	poller.Stop()
-	store.Close()     // fuerza el flush final de cualquier cambio pendiente a disco
-	userStore.Close() // idem para users.json
+	store.Close() // fuerza el flush final de cualquier cambio pendiente a disco
+	pool.Close()  // cierra las conexiones a PostgreSQL
 	log.Println("[Shutdown] Apagado completo.")
+}
+
+// seedInitialUsers deja la base lista para el primer arranque: si no hay usuarios, importa los del
+// users.json de la versión anterior (si existe) y, si tampoco hay, siembra el superadmin inicial con
+// SEED_SUPERADMIN_EMAIL / SEED_SUPERADMIN_PASSWORD (sin contraseña se genera una y se imprime UNA vez
+// en el log). Con usuarios ya cargados no hace nada.
+func seedInitialUsers(ctx context.Context, userStore *storage.UserStore, dataDir string) error {
+	count, err := userStore.CountUsers(ctx)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	legacyPath := filepath.Join(dataDir, "users.json")
+	imported, err := userStore.ImportLegacyUsers(ctx, legacyPath)
+	if err != nil {
+		return fmt.Errorf("importar el users.json anterior: %w", err)
+	}
+	if imported > 0 {
+		log.Printf("[UserStore] Se importaron %d usuario(s) desde %s (el archivo quedó como users.json.migrated)", imported, legacyPath)
+		return nil
+	}
+
+	seedEmail := os.Getenv("SEED_SUPERADMIN_EMAIL")
+	if seedEmail == "" {
+		seedEmail = "admin@prensaabierta.com"
+	}
+	seedPassword := os.Getenv("SEED_SUPERADMIN_PASSWORD")
+	generated := seedPassword == ""
+	if generated {
+		seedPassword = randomPassword()
+	}
+	seedUser, err := userStore.CreateUser(ctx, "Superadmin", seedEmail, seedPassword, models.RoleSuperAdmin)
+	if err != nil {
+		return fmt.Errorf("sembrar el superadmin inicial: %w", err)
+	}
+	if generated {
+		log.Printf("[UserStore] Superadmin inicial creado: email=%s password=%s (generada, cambiarla apenas se inicie sesión; login vía POST /api/auth/login)", seedUser.Email, seedPassword)
+	} else {
+		log.Printf("[UserStore] Superadmin inicial creado: email=%s (password de SEED_SUPERADMIN_PASSWORD; login vía POST /api/auth/login)", seedUser.Email)
+	}
+	return nil
 }
 
 // randomPassword genera una contraseña aleatoria legible (16 hex chars) para

@@ -21,54 +21,34 @@ func (r Role) IsValid() bool {
 	}
 }
 
-// DailyVideoLimitByRole define cuántos renders de video puede pedir por día
-// un usuario de cada rol. -1 significa sin límite. Superadmin/admin no tienen
-// tope; el límite real hoy solo aplica a editor. Cambiar el límite de todos
-// los editores es un solo valor acá, no hay que tocar usuarios uno por uno.
-var DailyVideoLimitByRole = map[Role]int{
-	RoleSuperAdmin: -1,
-	RoleAdmin:      -1,
-	RoleEditor:     5,
-}
-
-// DailyVideoLimitForRole resuelve el límite diario de un rol. Un rol
-// desconocido (dato corrupto/legacy) se trata como el más restrictivo
-// (editor) en vez de sin límite, para no abrir una puerta trasera.
-func DailyVideoLimitForRole(role Role) int {
-	if limit, ok := DailyVideoLimitByRole[role]; ok {
-		return limit
-	}
-	return DailyVideoLimitByRole[RoleEditor]
-}
-
-// User representa una cuenta del panel de administración. PasswordHash SÍ
-// lleva tag JSON (lo necesita el store para persistirlo en users.json), pero
-// ningún handler HTTP debe devolver un *User crudo: siempre llamar Public()
-// antes de mandarlo en una respuesta, para no filtrar el hash por la API.
+// User representa una cuenta del panel de administración (tabla users de PostgreSQL). ID es el
+// bigint de la base en formato string (la API siempre lo expuso como string). PasswordHash nunca se
+// serializa a JSON: ni siquiera un *User crudo puede filtrar el hash por la API.
 type User struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
 	Email        string `json:"email"`
-	PasswordHash string `json:"password_hash,omitempty"`
+	PasswordHash string `json:"-"`
 	Role         Role   `json:"role"`
 	Active       bool   `json:"active"`
-	// DailyVideoLimitOverride, si no es nil, pisa el límite del rol
-	// (DailyVideoLimitByRole) solo para ESTE usuario (ej. "este editor tiene
-	// 10, no 5"). nil = usa el default de su rol. Editable por admin/superadmin
-	// vía PUT /api/users/:id, nunca por el propio usuario.
-	DailyVideoLimitOverride *int      `json:"daily_video_limit_override,omitempty"`
-	CreatedAt               time.Time `json:"created_at"`
-	UpdatedAt               time.Time `json:"updated_at"`
+	// DailyVideoLimitOverride, si no es nil, pisa el límite del rol solo para ESTE usuario
+	// (ej. "este editor tiene 10, no 5"). nil = usa el default de su rol. Editable por
+	// admin/superadmin vía PUT /api/users/:id, nunca por el propio usuario.
+	DailyVideoLimitOverride *int `json:"daily_video_limit_override,omitempty"`
+	// RoleDailyVideoLimit es roles.daily_video_limit del rol del usuario (-1 = sin límite), cargado
+	// junto con el usuario. Es la fuente del límite por defecto: ya no está fijo en el código.
+	RoleDailyVideoLimit int       `json:"-"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
-// EffectiveDailyVideoLimit devuelve el límite diario de video que realmente
-// aplica a este usuario: su override personal si tiene uno, si no el default
-// de su rol.
+// EffectiveDailyVideoLimit devuelve el límite diario de video que realmente aplica a este usuario:
+// su override personal si tiene uno, si no el de su rol. -1 = sin límite.
 func (u User) EffectiveDailyVideoLimit() int {
 	if u.DailyVideoLimitOverride != nil {
 		return *u.DailyVideoLimitOverride
 	}
-	return DailyVideoLimitForRole(u.Role)
+	return u.RoleDailyVideoLimit
 }
 
 // Public devuelve una copia del usuario sin PasswordHash, segura de exponer
@@ -124,14 +104,4 @@ type RefreshToken struct {
 	Token     string    `json:"token"`
 	UserID    string    `json:"user_id"`
 	ExpiresAt time.Time `json:"expires_at"`
-}
-
-// VideoUsage cuenta cuántos renders pidió un usuario en un día calendario
-// dado (Date en formato "2006-01-02", huso horario del servidor). La clave
-// de almacenamiento es UserID+Date, así que el contador se reinicia solo:
-// no hace falta ningún job de reset a medianoche.
-type VideoUsage struct {
-	UserID string `json:"user_id"`
-	Date   string `json:"date"`
-	Count  int    `json:"count"`
 }

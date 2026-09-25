@@ -1,6 +1,30 @@
 package models
 
-import "time"
+import (
+	"net/url"
+	"strings"
+	"time"
+)
+
+// LinkKey identifica una nota de un medio por su link, ignorando query,
+// fragmento, mayúsculas y "/" final. Sirve para no duplicar una nota cuando el
+// medio le edita el titular (el hash titular+link cambia pero el link no).
+// Devuelve "" si el link no sirve como identidad (vacío o solo el dominio).
+func LinkKey(sourceID, link string) string {
+	link = strings.TrimSpace(link)
+	if link == "" {
+		return ""
+	}
+	u, err := url.Parse(link)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	path := strings.TrimRight(strings.ToLower(u.Path), "/")
+	if path == "" {
+		return ""
+	}
+	return sourceID + "|" + strings.ToLower(u.Host) + path
+}
 
 // Source represents a Puerto Rico news outlet
 type Source struct {
@@ -11,6 +35,27 @@ type Source struct {
 	Category    string `json:"category"`
 	Enabled     bool   `json:"enabled"`
 	PollMinutes int    `json:"poll_minutes"`
+	// LogoURL es el logo/favicon público del medio, usado por el frontend para
+	// mostrar de qué diario viene cada noticia relacionada (ver RelatedSource).
+	LogoURL string `json:"logo_url,omitempty"`
+	// WordPressREST indica que el medio corre WordPress con la API REST abierta: la
+	// imagen destacada de sus notas (ya en varios tamaños) se pide en UNA sola
+	// petición por ciclo, en vez de leer la página de cada artículo (que algunos
+	// medios, ej. La Perla del Sur, bloquean con un 403 al Engine).
+	WordPressREST bool `json:"wordpress_rest,omitempty"`
+}
+
+// RelatedSource es OTRO medio (de los ya scrapeados) que publicó, a criterio del
+// matcher léxico, la misma noticia que un RawNews dado. Se calcula y persiste al
+// ingerir (ver pkg/matcher) — no es un cálculo en vivo en cada lectura.
+type RelatedSource struct {
+	SourceID      string    `json:"source_id"`
+	SourceName    string    `json:"source_name"`
+	SourceLogoURL string    `json:"source_logo_url,omitempty"`
+	URL           string    `json:"url"`
+	Title         string    `json:"title"`
+	PublishedAt   time.Time `json:"published_at"`
+	Similarity    float64   `json:"similarity"` // 0..1
 }
 
 // RawNews represents an ingested news item from a PR outlet
@@ -29,6 +74,10 @@ type RawNews struct {
 	Category    string    `json:"category,omitempty"`
 	Status      string    `json:"status"` // "pending", "processing", "processed", "rejected"
 	Hash        string    `json:"hash"`   // For deduplication
+	// RelatedSources son otros medios (de los ya scrapeados) que publicaron la
+	// misma noticia, según el matcher léxico. Opcional: las noticias ingeridas
+	// antes de esta feature no lo traen hasta que corra el backfill.
+	RelatedSources []RelatedSource `json:"related_sources,omitempty"`
 }
 
 // VideoDirection are the AI's (or autonomous engine's) COMPOSITION decisions for

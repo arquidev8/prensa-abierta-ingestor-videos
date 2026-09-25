@@ -1,6 +1,28 @@
 version: '3.8'
 
 services:
+  # Usuarios, roles y contador diario de videos viven acá (el resto de los datos sigue en
+  # services/engine/data). Las migraciones de esquema las aplica el Engine al arrancar.
+  postgres:
+    image: postgres:16-alpine
+    container_name: prensa_abierta_postgres
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-prensa}
+      # Sin valor por defecto a propósito: define POSTGRES_PASSWORD en el .env (ver .env.example).
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en el .env (ver .env.example)}
+      - POSTGRES_DB=${POSTGRES_DB:-prensa_abierta}
+    ports:
+      # Solo loopback: sirve para psql/GUIs desde tu máquina, nunca queda expuesto a la red.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prensa} -d ${POSTGRES_DB:-prensa_abierta}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   engine:
     build:
       context: ./services/engine
@@ -14,6 +36,12 @@ services:
       - ASSETS_DIR=/app/assets
       # Tamaño del worker pool que limita cuántos renders de FFmpeg corren en paralelo
       - VIDEO_RENDER_WORKERS=2
+      # Matcher "misma noticia en otros medios" (solo entre las 5 fuentes RSS ya
+      # scrapeadas): score mínimo 0..1 para enlazar dos noticias y ventana horaria
+      # (en cualquier dirección) fuera de la cual no se comparan. Ajustables sin
+      # recompilar mientras se afina con datos reales; ver pkg/matcher.
+      - RELATED_NEWS_SIMILARITY_THRESHOLD=${RELATED_NEWS_SIMILARITY_THRESHOLD:-0.12}
+      - RELATED_NEWS_WINDOW_HOURS=${RELATED_NEWS_WINDOW_HOURS:-48}
       # URLs públicas del logo / banner en Cloudinary (banco de medios migrado).
       # Opcionales: si están vacías, el Engine usa el archivo local en
       # assets/logos como hasta ahora. Se descargan una sola vez al arrancar.
@@ -23,6 +51,12 @@ services:
       # Sin contraseña, el Engine genera una aleatoria y la imprime UNA vez en `docker logs`.
       - SEED_SUPERADMIN_EMAIL=${SEED_SUPERADMIN_EMAIL:-}
       - SEED_SUPERADMIN_PASSWORD=${SEED_SUPERADMIN_PASSWORD:-}
+      # Conexión a PostgreSQL. Por defecto apunta al servicio `postgres` de este compose; para una base
+      # gestionada (RDS, Supabase, etc.) define DATABASE_URL en el .env. Si la contraseña lleva
+      # caracteres especiales, en la URL deben ir codificados (%40 para @, etc.).
+      - DATABASE_URL=${DATABASE_URL:-postgres://${POSTGRES_USER:-prensa}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-prensa_abierta}?sslmode=disable}
+      # Zona horaria que define cuándo empieza el "día" del límite diario de videos.
+      - USAGE_TIMEZONE=${USAGE_TIMEZONE:-America/Puerto_Rico}
       # Clave para firmar los access tokens (JWT, duran 15 min). Sin ella, el Engine genera
       # una aleatoria al arrancar; importa sobre todo si corrés más de una instancia del
       # Engine a la vez (deben compartir la misma clave para validar el token de la otra).
@@ -42,6 +76,9 @@ services:
     volumes:
       - ./services/engine/data:/app/data
       - ./assets:/app/assets
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   web:
@@ -83,3 +120,6 @@ services:
     depends_on:
       - engine
     restart: unless-stopped
+
+volumes:
+  pgdata:

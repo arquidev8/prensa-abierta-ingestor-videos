@@ -1,116 +1,122 @@
 package storage
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-	"os"
-	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prensa-abierta/ingestor-engine/pkg/models"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// refreshTokenTTL es cuánto dura el refresh token (5 días) antes de exigir un
-// login nuevo con email/password. El access token (JWT, ver pkg/auth) dura
-// mucho menos (15 min) y se renueva con el refresh token sin pedir credenciales
-// de nuevo — ver POST /api/auth/refresh. Los refresh tokens viven solo en
-// memoria (ver models.RefreshToken), así que también se pierden si el proceso
-// se reinicia (misma sesión que exigía credenciales de nuevo antes de este
-// cambio; es un default aceptado para esta herramienta interna).
+// refreshTokenTTL es cuánto dura el refresh token (5 días) antes de exigir un login nuevo con
+// email/password. El access token (JWT, ver pkg/auth) dura mucho menos (15 min) y se renueva con el
+// refresh token sin pedir credenciales de nuevo — ver POST /api/auth/refresh. Los refresh tokens
+// viven solo en memoria (ver models.RefreshToken): reiniciar el proceso cierra las sesiones.
 const refreshTokenTTL = 5 * 24 * time.Hour
 
-// UserStore persiste usuarios/roles y el contador de uso diario de video en
-// un archivo separado (users.json), aislado de db.json (noticias/media), a
-// pedido explícito: es una tabla nueva que primero se prueba en local antes
-// de pensar en cómo convivirá con el resto de la data en producción.
-type UserStore struct {
-	mu           sync.RWMutex
-	users        map[string]*models.User
-	videoUsage   map[string]*models.VideoUsage // key: userID + "|" + date (YYYY-MM-DD)
-	dataFilePath string
+// Códigos de error de PostgreSQL que el store traduce a errores de entrada.
+const (
+	pgUniqueViolation     = "23505"
+	pgForeignKeyViolation = "23503"
+)
 
-	// refreshMu protege refreshTokens por separado de mu: nunca se persisten a
-	// disco, así que no participan del flush debounced ni de "dirty" —
-	// separarlas evita que el tráfico de login/autenticación/refresh contienda
-	// por el mismo lock que las mutaciones que sí se persisten.
+var (
+	// ErrUserNotFound: el usuario no existe (o el id no tiene formato de id).
+	ErrUserNotFound = errors.New("usuario no encontrado")
+	// ErrInvalidCredentials: email inexistente o contraseña incorrecta. Es el mismo error para
+	// ambos casos a propósito, para no revelar qué correos están registrados.
+	ErrInvalidCredentials = errors.New("credenciales inválidas")
+	// ErrUserInactive: las credenciales son correctas pero la cuenta está desactivada.
+	ErrUserInactive = errors.New("usuario inactivo")
+	// ErrInvalidRefreshToken: el refresh token no existe, ya se usó o venció.
+	ErrInvalidRefreshToken = errors.New("refresh token inválido o expirado")
+)
+
+// InputError es un error de datos enviados por el cliente (validación, correo duplicado, rol
+// inexistente). Su texto se muestra tal cual al usuario y el handler lo responde como 400; los
+// demás errores (base caída, etc.) son fallas internas y se responden como 500.
+type InputError string
+
+func (e InputError) Error() string { return string(e) }
+
+// UserStore guarda usuarios, roles y el contador diario de videos en PostgreSQL.
+type UserStore struct {
+	pool *pgxpool.Pool
+	// usageTZ es la zona horaria (nombre IANA) que define cuándo empieza el "día" del contador de
+	// videos; la evalúa PostgreSQL, que trae su propia base de zonas horarias.
+	usageTZ string
+
+	// refreshTokens vive solo en memoria (ver refreshTokenTTL).
 	refreshMu     sync.Mutex
 	refreshTokens map[string]*models.RefreshToken
-
-	dirty  bool
-	stopCh chan struct{}
-	wg     sync.WaitGroup
 }
 
-// NewUserStore inicializa el store de usuarios, cargando users.json si existe
-// y arrancando el mismo patrón de persistencia debounced/atómica que Store.
-func NewUserStore(dataDir string) *UserStore {
-	_ = os.MkdirAll(dataDir, 0755)
-	us := &UserStore{
-		users:         make(map[string]*models.User),
-		videoUsage:    make(map[string]*models.VideoUsage),
+// NewUserStore crea el store sobre un pool ya conectado y con las migraciones aplicadas. Falla si
+// usageTZ no es una zona horaria que PostgreSQL reconozca.
+func NewUserStore(ctx context.Context, pool *pgxpool.Pool, usageTZ string) (*UserStore, error) {
+	var probe time.Time
+	if err := pool.QueryRow(ctx, `SELECT now() AT TIME ZONE $1`, usageTZ).Scan(&probe); err != nil {
+		return nil, fmt.Errorf("zona horaria %q inválida: %w", usageTZ, err)
+	}
+	return &UserStore{
+		pool:          pool,
+		usageTZ:       usageTZ,
 		refreshTokens: make(map[string]*models.RefreshToken),
-		dataFilePath:  filepath.Join(dataDir, "users.json"),
-		stopCh:        make(chan struct{}),
-	}
-	us.loadFromFile()
-
-	us.wg.Add(1)
-	go us.persistLoop()
-
-	return us
+	}, nil
 }
 
-func usageKey(userID, date string) string {
-	return userID + "|" + date
+// El usuario siempre se lee con su rol para traer el límite diario por defecto.
+const (
+	userColumns = `u.id, u.name, u.email, u.password_hash, u.role, u.active,
+		u.daily_video_limit_override, r.daily_video_limit, u.created_at, u.updated_at`
+	userFrom = ` FROM users u JOIN roles r ON r.name = u.role`
+	// userFromCTE es lo mismo pero leyendo el resultado de un INSERT/UPDATE ... RETURNING declarado como
+	// CTE `u`: el SELECT final NO puede leer la tabla users, porque no ve las filas que escribió la CTE.
+	userFromCTE = ` FROM u JOIN roles r ON r.name = u.role`
+	// usageToday es la fecha de hoy en la zona horaria configurada; el parámetro %d es el de usageTZ.
+	usageToday = `(now() AT TIME ZONE $%d)::date`
+)
+
+func scanUser(row pgx.Row) (*models.User, error) {
+	var (
+		u        models.User
+		id       int64
+		role     string
+		override *int
+	)
+	if err := row.Scan(&id, &u.Name, &u.Email, &u.PasswordHash, &role, &u.Active,
+		&override, &u.RoleDailyVideoLimit, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		return nil, err
+	}
+	u.ID = strconv.FormatInt(id, 10)
+	u.Role = models.Role(role)
+	u.DailyVideoLimitOverride = override
+	return &u, nil
 }
 
-// CreateUser genera un ID nuevo y guarda el usuario con su contraseña
-// hasheada (bcrypt). Devuelve error si el rol no es válido, si falta algún
-// campo obligatorio, si la contraseña es demasiado corta, o si el email ya
-// está en uso (case-insensitive-ish: se compara tal cual llega).
-func (us *UserStore) CreateUser(name, email, password string, role models.Role) (*models.User, error) {
-	if !role.IsValid() {
-		return nil, fmt.Errorf("rol inválido: %q", role)
-	}
-	if name == "" || email == "" {
-		return nil, fmt.Errorf("name y email son obligatorios")
-	}
-	if len(password) < 8 {
-		return nil, fmt.Errorf("la contraseña debe tener al menos 8 caracteres")
-	}
-	hash, err := hashPassword(password)
-	if err != nil {
-		return nil, fmt.Errorf("no se pudo generar el hash de la contraseña: %w", err)
-	}
+// parseID convierte el id de la API (string) al bigint de la base; un id que no es un entero
+// positivo (p. ej. un "usr_..." viejo dentro de un token anterior a la migración) no existe.
+func parseID(id string) (int64, bool) {
+	n, err := strconv.ParseInt(id, 10, 64)
+	return n, err == nil && n > 0
+}
 
-	us.mu.Lock()
-	defer us.mu.Unlock()
-
-	for _, existing := range us.users {
-		if existing.Email == email {
-			return nil, fmt.Errorf("ya existe un usuario con el email %q", email)
-		}
+func pgErrorCode(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
 	}
-
-	now := time.Now()
-	user := &models.User{
-		ID:           fmt.Sprintf("usr_%d", now.UnixNano()),
-		Name:         name,
-		Email:        email,
-		PasswordHash: hash,
-		Role:         role,
-		Active:       true,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-	us.users[user.ID] = user
-	us.dirty = true
-	return user, nil
+	return ""
 }
 
 func hashPassword(password string) (string, error) {
@@ -118,108 +124,135 @@ func hashPassword(password string) (string, error) {
 	return string(bytes), err
 }
 
-// VerifyPassword compara una contraseña en texto plano contra el hash
-// guardado del usuario.
+// CreateUser guarda un usuario nuevo con su contraseña hasheada (bcrypt). Los datos inválidos y el
+// correo repetido (sin distinguir mayúsculas) devuelven un InputError.
+func (us *UserStore) CreateUser(ctx context.Context, name, email, password string, role models.Role) (*models.User, error) {
+	name, email = strings.TrimSpace(name), strings.TrimSpace(email)
+	if !role.IsValid() {
+		return nil, InputError(fmt.Sprintf("rol inválido: %q", role))
+	}
+	if name == "" || email == "" {
+		return nil, InputError("name y email son obligatorios")
+	}
+	if len(password) < 8 {
+		return nil, InputError("la contraseña debe tener al menos 8 caracteres")
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return nil, fmt.Errorf("generar el hash de la contraseña: %w", err)
+	}
+
+	row := us.pool.QueryRow(ctx, `
+		WITH u AS (
+			INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4)
+			RETURNING *
+		) SELECT `+userColumns+userFromCTE, name, email, hash, string(role))
+	user, err := scanUser(row)
+	switch {
+	case err == nil:
+		return user, nil
+	case pgErrorCode(err) == pgUniqueViolation:
+		return nil, InputError(fmt.Sprintf("ya existe un usuario con el email %q", email))
+	case pgErrorCode(err) == pgForeignKeyViolation:
+		return nil, InputError(fmt.Sprintf("rol inválido: %q", role))
+	default:
+		return nil, fmt.Errorf("crear usuario: %w", err)
+	}
+}
+
+// VerifyPassword compara una contraseña en texto plano contra el hash guardado del usuario.
 func (us *UserStore) VerifyPassword(user *models.User, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) == nil
 }
 
-// VerifyCredentials resuelve el login: busca el usuario por email y valida
-// la contraseña. Un email inexistente y una contraseña incorrecta devuelven
-// exactamente el mismo error, para no filtrar por timing/mensaje si un email
-// está o no registrado.
-func (us *UserStore) VerifyCredentials(email, password string) (*models.User, error) {
-	us.mu.RLock()
-	var match *models.User
-	for _, u := range us.users {
-		if u.Email == email {
-			match = u
-			break
-		}
-	}
-	us.mu.RUnlock()
+var (
+	dummyHashOnce sync.Once
+	dummyHash     []byte
+)
 
-	if match == nil || !us.VerifyPassword(match, password) {
-		return nil, fmt.Errorf("credenciales inválidas")
-	}
-	if !match.Active {
-		return nil, fmt.Errorf("usuario inactivo")
-	}
-	return match, nil
+// burnPasswordCheck gasta el mismo tiempo que una verificación real cuando el correo no existe,
+// para que el login no revele por su duración qué correos están registrados.
+func burnPasswordCheck(password string) {
+	dummyHashOnce.Do(func() { dummyHash, _ = bcrypt.GenerateFromPassword([]byte("no-such-user"), bcrypt.DefaultCost) })
+	_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 }
 
-// newRefreshTokenString genera el string opaco del refresh token (32 bytes
-// aleatorios en hex), mismo patrón que ya usaban las sesiones antes de JWT.
+// VerifyCredentials resuelve el login: busca el usuario por correo (sin distinguir mayúsculas) y
+// valida la contraseña. Devuelve ErrInvalidCredentials o ErrUserInactive; cualquier otro error es
+// una falla de la base.
+func (us *UserStore) VerifyCredentials(ctx context.Context, email, password string) (*models.User, error) {
+	row := us.pool.QueryRow(ctx, `SELECT `+userColumns+userFrom+` WHERE lower(u.email) = lower($1)`, strings.TrimSpace(email))
+	user, err := scanUser(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		burnPasswordCheck(password)
+		return nil, ErrInvalidCredentials
+	}
+	if err != nil {
+		return nil, fmt.Errorf("buscar usuario por correo: %w", err)
+	}
+	if !us.VerifyPassword(user, password) {
+		return nil, ErrInvalidCredentials
+	}
+	if !user.Active {
+		return nil, ErrUserInactive
+	}
+	return user, nil
+}
+
+// newRefreshTokenString genera el string opaco del refresh token (32 bytes aleatorios en hex).
 func newRefreshTokenString() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("no se pudo generar el refresh token: %w", err)
+		return "", fmt.Errorf("generar el refresh token: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
 }
 
-// CreateRefreshToken emite un refresh token nuevo (refreshTokenTTL, 5 días) para
-// el usuario ya autenticado por VerifyCredentials. El access token (JWT) de cada
-// login/refresh lo emite pkg/auth por separado — este store solo guarda el lado
-// opaco y de larga vida.
+// CreateRefreshToken emite un refresh token nuevo (refreshTokenTTL) para un usuario ya autenticado.
+// El access token (JWT) lo emite pkg/auth por separado: este store solo guarda el lado opaco.
 func (us *UserStore) CreateRefreshToken(userID string) (*models.RefreshToken, error) {
 	tokenStr, err := newRefreshTokenString()
 	if err != nil {
 		return nil, err
 	}
-	rt := &models.RefreshToken{
-		Token:     tokenStr,
-		UserID:    userID,
-		ExpiresAt: time.Now().Add(refreshTokenTTL),
-	}
+	rt := &models.RefreshToken{Token: tokenStr, UserID: userID, ExpiresAt: time.Now().Add(refreshTokenTTL)}
 	us.refreshMu.Lock()
 	us.refreshTokens[rt.Token] = rt
 	us.refreshMu.Unlock()
 	return rt, nil
 }
 
-// RotateRefreshToken cambia un refresh token válido por uno nuevo (de un solo
-// uso: el viejo se invalida en el mismo paso) y devuelve el usuario dueño, ya
-// recargado del store (para que el caller vea su Active/Role más recientes, no
-// los que tenía al momento del login). La expiración ABSOLUTA se conserva del
-// token original — refrescar no extiende la sesión más allá de los 5 días desde
-// el login, aunque el usuario esté usando la app activamente todo ese tiempo.
-func (us *UserStore) RotateRefreshToken(oldToken string) (*models.RefreshToken, *models.User, error) {
+// RotateRefreshToken cambia un refresh token válido por uno nuevo (de un solo uso: el viejo se
+// invalida en el mismo paso) y devuelve el usuario dueño, recargado de la base para ver su
+// Active/Role más recientes. La expiración ABSOLUTA se conserva: refrescar no extiende la sesión
+// más allá de refreshTokenTTL desde el login.
+func (us *UserStore) RotateRefreshToken(ctx context.Context, oldToken string) (*models.RefreshToken, *models.User, error) {
 	us.refreshMu.Lock()
 	old, ok := us.refreshTokens[oldToken]
 	if ok {
-		delete(us.refreshTokens, oldToken) // de un solo uso: se invalida se use o no la rotación
+		delete(us.refreshTokens, oldToken)
 	}
-	expired := ok && time.Now().After(old.ExpiresAt)
 	us.refreshMu.Unlock()
-
-	if !ok || expired {
-		return nil, nil, fmt.Errorf("refresh token inválido o expirado")
+	if !ok || time.Now().After(old.ExpiresAt) {
+		return nil, nil, ErrInvalidRefreshToken
 	}
 
-	user, exists := us.GetUser(old.UserID)
-	if !exists {
-		return nil, nil, fmt.Errorf("el usuario del refresh token ya no existe")
+	user, err := us.GetUser(ctx, old.UserID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("usuario del refresh token: %w", err)
 	}
-
 	newTokenStr, err := newRefreshTokenString()
 	if err != nil {
 		return nil, nil, err
 	}
-	rotated := &models.RefreshToken{
-		Token:     newTokenStr,
-		UserID:    old.UserID,
-		ExpiresAt: old.ExpiresAt, // absoluto: no se reinicia el conteo de 5 días
-	}
+	rotated := &models.RefreshToken{Token: newTokenStr, UserID: old.UserID, ExpiresAt: old.ExpiresAt}
 	us.refreshMu.Lock()
 	us.refreshTokens[rotated.Token] = rotated
 	us.refreshMu.Unlock()
-
 	return rotated, user, nil
 }
 
-// RevokeRefreshToken invalida un refresh token (usado en logout). Idempotente:
-// no es error llamarlo con un token que ya no existe o nunca existió.
+// RevokeRefreshToken invalida un refresh token (logout). Idempotente.
 func (us *UserStore) RevokeRefreshToken(token string) {
 	if token == "" {
 		return
@@ -229,207 +262,220 @@ func (us *UserStore) RevokeRefreshToken(token string) {
 	us.refreshMu.Unlock()
 }
 
-func (us *UserStore) GetUser(id string) (*models.User, bool) {
-	us.mu.RLock()
-	defer us.mu.RUnlock()
-	user, ok := us.users[id]
-	return user, ok
-}
-
-func (us *UserStore) GetAllUsers() []*models.User {
-	us.mu.RLock()
-	defer us.mu.RUnlock()
-	list := make([]*models.User, 0, len(us.users))
-	for _, u := range us.users {
-		list = append(list, u)
+// GetUser devuelve el usuario o ErrUserNotFound.
+func (us *UserStore) GetUser(ctx context.Context, id string) (*models.User, error) {
+	n, ok := parseID(id)
+	if !ok {
+		return nil, ErrUserNotFound
 	}
-	return list
+	user, err := scanUser(us.pool.QueryRow(ctx, `SELECT `+userColumns+userFrom+` WHERE u.id = $1`, n))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("leer usuario: %w", err)
+	}
+	return user, nil
 }
 
-// UserUpdate son los cambios parciales a aplicar sobre un usuario: los
-// punteros nil dejan el campo como estaba. Los permisos de QUIÉN puede tocar
-// QUÉ campo (self vs. admin vs. superadmin, confirmación de contraseña
-// actual, etc.) se validan en el handler HTTP antes de llamar a UpdateUser —
-// el store solo aplica los cambios ya autorizados.
+// GetAllUsers devuelve todos los usuarios, del más antiguo al más nuevo.
+func (us *UserStore) GetAllUsers(ctx context.Context) ([]*models.User, error) {
+	rows, err := us.pool.Query(ctx, `SELECT `+userColumns+userFrom+` ORDER BY u.id`)
+	if err != nil {
+		return nil, fmt.Errorf("listar usuarios: %w", err)
+	}
+	defer rows.Close()
+
+	var users []*models.User
+	for rows.Next() {
+		user, err := scanUser(rows)
+		if err != nil {
+			return nil, fmt.Errorf("leer fila de usuario: %w", err)
+		}
+		users = append(users, user)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listar usuarios: %w", err)
+	}
+	return users, nil
+}
+
+// CountUsers devuelve cuántos usuarios hay (para decidir si hay que sembrar el superadmin).
+func (us *UserStore) CountUsers(ctx context.Context) (int, error) {
+	var n int
+	if err := us.pool.QueryRow(ctx, `SELECT count(*) FROM users`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("contar usuarios: %w", err)
+	}
+	return n, nil
+}
+
+// UserUpdate son los cambios parciales a aplicar sobre un usuario: los punteros nil dejan el campo
+// como estaba. Los permisos de QUIÉN puede tocar QUÉ campo se validan en el handler HTTP antes de
+// llamar a UpdateUser: el store solo aplica los cambios ya autorizados.
 type UserUpdate struct {
 	Name     *string
 	Email    *string
 	Password *string
 	Role     *models.Role
 	Active   *bool
-	// DailyVideoLimitOverride, si no es nil, reemplaza el override actual.
-	// ClearDailyVideoLimitOverride, si es true, lo borra (vuelve al default
-	// del rol) — tiene prioridad sobre DailyVideoLimitOverride si ambos vienen.
+	// DailyVideoLimitOverride, si no es nil, reemplaza el override actual. ClearDailyVideoLimitOverride,
+	// si es true, lo borra (vuelve al default del rol) y tiene prioridad sobre el anterior.
 	DailyVideoLimitOverride      *int
 	ClearDailyVideoLimitOverride bool
 }
 
-func (us *UserStore) UpdateUser(id string, upd UserUpdate) (*models.User, error) {
-	var newHash string
+// UpdateUser aplica los cambios y devuelve el usuario actualizado. ErrUserNotFound si no existe;
+// InputError si los datos son inválidos o el correo ya está en uso.
+func (us *UserStore) UpdateUser(ctx context.Context, id string, upd UserUpdate) (*models.User, error) {
+	n, ok := parseID(id)
+	if !ok {
+		return nil, ErrUserNotFound
+	}
+
+	sets := []string{"updated_at = now()"}
+	var args []any
+	set := func(column string, value any) {
+		args = append(args, value)
+		sets = append(sets, fmt.Sprintf("%s = $%d", column, len(args)))
+	}
+
+	if upd.Role != nil {
+		if !upd.Role.IsValid() {
+			return nil, InputError(fmt.Sprintf("rol inválido: %q", *upd.Role))
+		}
+		set("role", string(*upd.Role))
+	}
+	if upd.Name != nil {
+		set("name", strings.TrimSpace(*upd.Name))
+	}
+	email := ""
+	if upd.Email != nil {
+		email = strings.TrimSpace(*upd.Email)
+		set("email", email)
+	}
+	if upd.Active != nil {
+		set("active", *upd.Active)
+	}
 	if upd.Password != nil {
 		if len(*upd.Password) < 8 {
-			return nil, fmt.Errorf("la contraseña debe tener al menos 8 caracteres")
+			return nil, InputError("la contraseña debe tener al menos 8 caracteres")
 		}
 		hash, err := hashPassword(*upd.Password)
 		if err != nil {
-			return nil, fmt.Errorf("no se pudo generar el hash de la contraseña: %w", err)
+			return nil, fmt.Errorf("generar el hash de la contraseña: %w", err)
 		}
-		newHash = hash
-	}
-
-	us.mu.Lock()
-	defer us.mu.Unlock()
-
-	user, ok := us.users[id]
-	if !ok {
-		return nil, fmt.Errorf("usuario %q no encontrado", id)
-	}
-	if upd.Role != nil {
-		if !upd.Role.IsValid() {
-			return nil, fmt.Errorf("rol inválido: %q", *upd.Role)
-		}
-		user.Role = *upd.Role
-	}
-	if upd.Name != nil {
-		user.Name = *upd.Name
-	}
-	if upd.Email != nil {
-		for otherID, existing := range us.users {
-			if otherID != id && existing.Email == *upd.Email {
-				return nil, fmt.Errorf("ya existe un usuario con el email %q", *upd.Email)
-			}
-		}
-		user.Email = *upd.Email
-	}
-	if upd.Active != nil {
-		user.Active = *upd.Active
-	}
-	if newHash != "" {
-		user.PasswordHash = newHash
+		set("password_hash", hash)
 	}
 	if upd.ClearDailyVideoLimitOverride {
-		user.DailyVideoLimitOverride = nil
+		sets = append(sets, "daily_video_limit_override = NULL")
 	} else if upd.DailyVideoLimitOverride != nil {
-		user.DailyVideoLimitOverride = upd.DailyVideoLimitOverride
+		set("daily_video_limit_override", *upd.DailyVideoLimitOverride)
 	}
-	user.UpdatedAt = time.Now()
-	us.dirty = true
-	return user, nil
+
+	args = append(args, n)
+	query := fmt.Sprintf(`
+		WITH u AS (
+			UPDATE users SET %s WHERE id = $%d RETURNING *
+		) SELECT `+userColumns+userFromCTE, strings.Join(sets, ", "), len(args))
+	user, err := scanUser(us.pool.QueryRow(ctx, query, args...))
+	switch {
+	case err == nil:
+		return user, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, ErrUserNotFound
+	case pgErrorCode(err) == pgUniqueViolation:
+		return nil, InputError(fmt.Sprintf("ya existe un usuario con el email %q", email))
+	case pgErrorCode(err) == pgForeignKeyViolation:
+		return nil, InputError("rol inválido")
+	default:
+		return nil, fmt.Errorf("actualizar usuario: %w", err)
+	}
 }
 
-func (us *UserStore) DeleteUser(id string) bool {
-	us.mu.Lock()
-	defer us.mu.Unlock()
-	if _, ok := us.users[id]; !ok {
-		return false
-	}
-	delete(us.users, id)
-	us.dirty = true
-	return true
-}
-
-// VideoUsageToday devuelve cuánto lleva usado hoy un usuario.
-func (us *UserStore) VideoUsageToday(userID string) int {
-	us.mu.RLock()
-	defer us.mu.RUnlock()
-	today := time.Now().Format("2006-01-02")
-	if usage, ok := us.videoUsage[usageKey(userID, today)]; ok {
-		return usage.Count
-	}
-	return 0
-}
-
-// CanGenerateVideo evalúa el límite diario efectivo del usuario (su override
-// personal si tiene uno, si no el del rol) contra su uso de hoy. limit=-1
-// significa sin límite.
-func (us *UserStore) CanGenerateVideo(user *models.User) (allowed bool, limit int, used int) {
-	limit = user.EffectiveDailyVideoLimit()
-	used = us.VideoUsageToday(user.ID)
-	if limit < 0 {
-		return true, limit, used
-	}
-	return used < limit, limit, used
-}
-
-// IncrementVideoUsage suma 1 al contador de hoy para el usuario y devuelve
-// el nuevo total. Debe llamarse solo tras confirmar CanGenerateVideo y
-// encolar el render, para no contar intentos rechazados.
-func (us *UserStore) IncrementVideoUsage(userID string) int {
-	us.mu.Lock()
-	defer us.mu.Unlock()
-	today := time.Now().Format("2006-01-02")
-	key := usageKey(userID, today)
-	usage, ok := us.videoUsage[key]
+// DeleteUser borra al usuario (y, en cascada, su contador de videos). Devuelve false si no existía.
+func (us *UserStore) DeleteUser(ctx context.Context, id string) (bool, error) {
+	n, ok := parseID(id)
 	if !ok {
-		usage = &models.VideoUsage{UserID: userID, Date: today}
-		us.videoUsage[key] = usage
+		return false, nil
 	}
-	usage.Count++
-	us.dirty = true
-	return usage.Count
-}
-
-func (us *UserStore) persistLoop() {
-	defer us.wg.Done()
-	ticker := time.NewTicker(persistDebounceInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			us.flushIfDirty()
-		case <-us.stopCh:
-			us.flushIfDirty()
-			return
-		}
-	}
-}
-
-func (us *UserStore) flushIfDirty() {
-	us.mu.Lock()
-	if !us.dirty {
-		us.mu.Unlock()
-		return
-	}
-	us.dirty = false
-	data := map[string]interface{}{
-		"users":       us.users,
-		"video_usage": us.videoUsage,
-	}
-	bytes, err := json.MarshalIndent(data, "", "  ")
-	us.mu.Unlock()
-
+	tag, err := us.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, n)
 	if err != nil {
-		log.Printf("[UserStore] Error serializando datos para persistencia: %v", err)
-		return
+		return false, fmt.Errorf("borrar usuario: %w", err)
 	}
-	if err := writeFileAtomic(us.dataFilePath, bytes); err != nil {
-		log.Printf("[UserStore] Error escribiendo %s: %v", us.dataFilePath, err)
-	}
+	return tag.RowsAffected() > 0, nil
 }
 
-// Close detiene el loop de persistencia y espera el flush final. Debe
-// llamarse durante el apagado ordenado del server, igual que Store.Close().
-func (us *UserStore) Close() {
-	close(us.stopCh)
-	us.wg.Wait()
-}
-
-func (us *UserStore) loadFromFile() {
-	bytes, err := os.ReadFile(us.dataFilePath)
+// VideoUsageToday devuelve cuántos videos lleva el usuario hoy (día en la zona horaria configurada).
+func (us *UserStore) VideoUsageToday(ctx context.Context, userID string) (int, error) {
+	n, ok := parseID(userID)
+	if !ok {
+		return 0, nil
+	}
+	var used int
+	err := us.pool.QueryRow(ctx, fmt.Sprintf(
+		`SELECT COALESCE((SELECT count FROM video_usage WHERE user_id = $1 AND usage_date = `+usageToday+`), 0)`, 2),
+		n, us.usageTZ).Scan(&used)
 	if err != nil {
-		return
+		return 0, fmt.Errorf("leer uso diario de videos: %w", err)
 	}
-	var data struct {
-		Users      map[string]*models.User       `json:"users"`
-		VideoUsage map[string]*models.VideoUsage `json:"video_usage"`
+	return used, nil
+}
+
+// VideoQuota devuelve el límite diario efectivo del usuario (-1 = sin límite) y lo usado hoy.
+func (us *UserStore) VideoQuota(ctx context.Context, user *models.User) (limit, used int, err error) {
+	used, err = us.VideoUsageToday(ctx, user.ID)
+	return user.EffectiveDailyVideoLimit(), used, err
+}
+
+// ReserveVideoUsage suma 1 al contador de hoy SOLO si el usuario no llegó a su límite, en una única
+// sentencia atómica: dos pedidos simultáneos no pueden pasarse del tope. ok=false significa límite
+// alcanzado; used es lo consumido tras la operación. Quien reserva debe llamar a ReleaseVideoUsage si
+// el render finalmente no se encola.
+func (us *UserStore) ReserveVideoUsage(ctx context.Context, user *models.User) (ok bool, limit, used int, err error) {
+	n, valid := parseID(user.ID)
+	if !valid {
+		return false, 0, 0, ErrUserNotFound
 	}
-	if err := json.Unmarshal(bytes, &data); err == nil {
-		if data.Users != nil {
-			us.users = data.Users
-		}
-		if data.VideoUsage != nil {
-			us.videoUsage = data.VideoUsage
-		}
+	limit = user.EffectiveDailyVideoLimit()
+
+	if limit == 0 { // el upsert crearía la fila con 1: con tope 0 no se debe reservar nada
+		used, err = us.VideoUsageToday(ctx, user.ID)
+		return false, limit, used, err
 	}
+
+	// Sin tope (-1) se cuenta igual (para mostrar "hoy has generado N"), pero sin condición.
+	cond := ""
+	args := []any{n, us.usageTZ}
+	if limit > 0 {
+		cond = " WHERE video_usage.count < $3"
+		args = append(args, limit)
+	}
+	err = us.pool.QueryRow(ctx, fmt.Sprintf(`
+		INSERT INTO video_usage (user_id, usage_date, count) VALUES ($1, `+usageToday+`, 1)
+		ON CONFLICT (user_id, usage_date) DO UPDATE SET count = video_usage.count + 1`+cond+`
+		RETURNING count`, 2), args...).Scan(&used)
+	if errors.Is(err, pgx.ErrNoRows) { // el WHERE del upsert no se cumplió: ya está en el límite
+		used, err = us.VideoUsageToday(ctx, user.ID)
+		return false, limit, used, err
+	}
+	if err != nil {
+		return false, limit, 0, fmt.Errorf("reservar uso de video: %w", err)
+	}
+	return true, limit, used, nil
+}
+
+// ReleaseVideoUsage devuelve una reserva de ReserveVideoUsage (p. ej. si la cola de renders estaba
+// llena y el video no se encoló).
+func (us *UserStore) ReleaseVideoUsage(ctx context.Context, userID string) error {
+	n, ok := parseID(userID)
+	if !ok {
+		return nil
+	}
+	_, err := us.pool.Exec(ctx, fmt.Sprintf(
+		`UPDATE video_usage SET count = GREATEST(count - 1, 0) WHERE user_id = $1 AND usage_date = `+usageToday, 2),
+		n, us.usageTZ)
+	if err != nil {
+		return fmt.Errorf("liberar uso de video: %w", err)
+	}
+	return nil
 }
