@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -70,6 +71,154 @@ func (s *Store) GetRawNews(id string) (*models.RawNews, bool) {
 	defer s.mu.RUnlock()
 	item, ok := s.rawNews[id]
 	return item, ok
+}
+
+// RawNewsMissingImage devuelve, por URL original de la nota, los IDs de los
+// RawNews guardados sin imagen (varias copias de la misma nota comparten URL).
+// Con `since` distinto de cero solo cuenta las ingeridas desde entonces.
+func (s *Store) RawNewsMissingImage(since time.Time) map[string][]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string][]string)
+	for id, item := range s.rawNews {
+		if item.ImageURL != "" || item.OriginalURL == "" {
+			continue
+		}
+		if !since.IsZero() && item.IngestedAt.Before(since) {
+			continue
+		}
+		out[item.OriginalURL] = append(out[item.OriginalURL], id)
+	}
+	return out
+}
+
+// GetAllRawNewsDeduped devuelve UNA noticia por medio+link (models.LinkKey), para
+// el listado del Feed. No borra nada: las copias sobrantes (de reinicios viejos
+// del Engine, o del mismo link con el titular editado) siguen guardadas y
+// accesibles por ID. De cada grupo queda la mejor copia — primero la que ya
+// tiene una pieza procesada (para que el Feed no pierda su "Ver Pieza"), luego
+// la que tiene imagen, luego la más antigua — y además TODAS las que tengan
+// pieza procesada.
+func (s *Store) GetAllRawNewsDeduped() []*models.RawNews {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	referenced := make(map[string]bool, len(s.processedNews))
+	for _, p := range s.processedNews {
+		referenced[p.RawNewsID] = true
+	}
+
+	groups := make(map[string][]*models.RawNews, len(s.rawNews))
+	for _, item := range s.rawNews {
+		key := models.LinkKey(item.SourceID, item.OriginalURL)
+		if key == "" {
+			key = "hash|" + item.Hash // sin link utilizable: solo se colapsan copias exactas
+		}
+		groups[key] = append(groups[key], item)
+	}
+
+	out := make([]*models.RawNews, 0, len(groups))
+	for _, group := range groups {
+		if len(group) == 1 {
+			out = append(out, group[0])
+			continue
+		}
+		sort.Slice(group, func(i, j int) bool {
+			a, b := group[i], group[j]
+			if referenced[a.ID] != referenced[b.ID] {
+				return referenced[a.ID]
+			}
+			if (a.ImageURL != "") != (b.ImageURL != "") {
+				return a.ImageURL != ""
+			}
+			return a.IngestedAt.Before(b.IngestedAt)
+		})
+		out = append(out, group[0])
+		for _, extra := range group[1:] {
+			if referenced[extra.ID] {
+				out = append(out, extra)
+			}
+		}
+	}
+	return out
+}
+
+// SetRawNewsImage asigna la imagen a un RawNews que todavía no tiene una, bajo
+// el lock del store. Devuelve true si hubo un cambio.
+func (s *Store) SetRawNewsImage(id, imageURL string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	item, ok := s.rawNews[id]
+	if !ok || item.ImageURL != "" || imageURL == "" {
+		return false
+	}
+	item.ImageURL = imageURL
+	s.dirty = true
+	return true
+}
+
+// MutateAllRawNews aplica fn a cada RawNews bajo el lock del store (misma razón
+// que AppendRelatedSource: GetAllRawNews devuelve punteros al objeto interno).
+// fn devuelve true si modificó el item. Devuelve cuántos se modificaron y, si
+// hubo alguno, marca el store para persistir.
+func (s *Store) MutateAllRawNews(fn func(*models.RawNews) bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changed := 0
+	for _, item := range s.rawNews {
+		if fn(item) {
+			changed++
+		}
+	}
+	if changed > 0 {
+		s.dirty = true
+	}
+	return changed
+}
+
+// AppendRelatedSource agrega (o actualiza, si ya existía un match del mismo
+// SourceID) una fuente relacionada al RawNews `id`, bajo el lock del store —
+// GetAllRawNews devuelve punteros al mismo objeto que vive en el mapa interno,
+// así que mutarlos directamente desde afuera (ej. el matcher) sería una carrera
+// de datos; por eso la mutación vive acá, igual que el resto de los Save*.
+// Trunca la lista a maxKeep, ordenada por similitud descendente. No-op si el
+// RawNews no existe. Devuelve true si hubo un cambio real.
+func (s *Store) AppendRelatedSource(id string, related models.RelatedSource, maxKeep int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	item, ok := s.rawNews[id]
+	if !ok {
+		return false
+	}
+
+	replaced := false
+	for i, existing := range item.RelatedSources {
+		if existing.SourceID == related.SourceID {
+			if existing.Similarity >= related.Similarity {
+				return false // ya había un match igual o mejor de ese mismo medio
+			}
+			item.RelatedSources[i] = related
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		item.RelatedSources = append(item.RelatedSources, related)
+	}
+
+	sort.Slice(item.RelatedSources, func(i, j int) bool {
+		return item.RelatedSources[i].Similarity > item.RelatedSources[j].Similarity
+	})
+	if maxKeep > 0 && len(item.RelatedSources) > maxKeep {
+		item.RelatedSources = item.RelatedSources[:maxKeep]
+	}
+
+	s.dirty = true
+	return true
 }
 
 func (s *Store) SaveProcessedNews(item *models.ProcessedNews) {

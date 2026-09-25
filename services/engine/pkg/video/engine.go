@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/prensa-abierta/ingestor-engine/pkg/models"
+	"github.com/prensa-abierta/ingestor-engine/pkg/voice"
 )
 
 // defaultRenderQueueSize is how many jobs can wait in the queue before
@@ -35,7 +37,8 @@ type Engine struct {
 	assetsDir   string
 	outputDir   string
 	defaultLogo string
-	promoImage  string // banner "Descarga la App GRATIS", solo para el template "app-promo"
+	promoImage  string        // banner "Descarga la App GRATIS", solo para el template "app-promo"
+	voice       *voice.Client // nil = locución desactivada (sin ELEVENLABS_API_KEY)
 
 	mu   sync.Mutex // protege jobs y las mutaciones de sus campos
 	jobs map[string]*models.VideoJob
@@ -198,8 +201,12 @@ func (e *Engine) RenderVideo(ctx context.Context, jobID string) (*models.VideoJo
 		return job, err
 	}
 
+	// Locución (opcional): nunca falla el render, a lo sumo el video queda mudo.
+	voiceStatus := e.applyVoiceover(ctx, job, outputPath)
+
 	now := time.Now()
 	e.mu.Lock()
+	job.VoiceStatus = voiceStatus
 	job.Status = "completed"
 	job.Progress = 100
 	job.OutputPath = outputPath
@@ -286,16 +293,28 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	videoClipsAdded := 0
 	for i := 0; i < nClips; i++ {
 		clipURL := req.ClipURLs[i]
+		// El slot de "video de composición" también acepta una imagen (Editor de
+		// video, apps/web): se detecta por extensión y se renderiza con el MISMO
+		// zoom lento que la imagen de portada (`coverImageFilter`), en vez de
+		// tratarla como un clip de video — una imagen suelta por `-i` sin `-loop 1`
+		// solo produce 1 frame, así que necesita su propio camino.
+		isImg := isImageClipURL(clipURL)
 
-		// Los clips remotos (Pexels, CDN) se descargan a un archivo local ANTES de
-		// pasarlos a FFmpeg. Darle una URL a `-i` hace que FFmpeg la baje por su
-		// cuenta SIN timeout: un clip HD grande de stock o un CDN lento agotaba el
-		// timeout de render y el proceso moría con `signal: killed`. Con la descarga
-		// acotada (60s) acá, un clip lento se saltea (continue) en vez de tumbar
-		// todo el render.
+		// Los clips remotos (Pexels, CDN, subidas del Editor de video) se descargan
+		// a un archivo local ANTES de pasarlos a FFmpeg. Darle una URL a `-i` hace
+		// que FFmpeg la baje por su cuenta SIN timeout: un clip HD grande de stock o
+		// un CDN lento agotaba el timeout de render y el proceso moría con
+		// `signal: killed`. Con la descarga acotada acá, un clip lento se saltea
+		// (continue) en vez de tumbar todo el render.
 		inputPath := clipURL
 		if strings.HasPrefix(clipURL, "http://") || strings.HasPrefix(clipURL, "https://") {
-			local, derr := e.downloadToTempFile(ctx, clipURL, "src_clip_*.mp4", 60*time.Second)
+			pattern := "src_clip_*.mp4"
+			timeout := 60 * time.Second
+			if isImg {
+				pattern = "src_clip_img_*.jpg"
+				timeout = 20 * time.Second
+			}
+			local, derr := e.downloadToTempFile(ctx, clipURL, pattern, timeout)
 			if derr != nil {
 				log.Printf("[VideoEngine] Warning: no se pudo descargar el clip %s: %v", clipURL, derr)
 				continue
@@ -306,18 +325,35 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 
 		trimmedPath := filepath.Join(tempDir, fmt.Sprintf("clip_%d.mp4", i))
 
-		// Scale & Crop to 9:16 (1080x1920) and trim
-		filter := "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p"
-		args := []string{
-			"-y",
-			"-t", fmt.Sprintf("%.2f", clipDuration),
-			"-i", inputPath,
-			"-vf", filter,
-			"-c:v", "libx264",
-			"-preset", "ultrafast",
-			"-pix_fmt", "yuv420p",
-			"-an",
-			trimmedPath,
+		var args []string
+		if isImg {
+			secInt := int(clipDuration + 0.999)
+			args = []string{
+				"-y",
+				"-loop", "1", "-t", fmt.Sprintf("%.2f", clipDuration),
+				"-i", inputPath,
+				"-filter_complex", "[0:v]" + coverImageFilter(secInt) + ",fps=30,format=yuv420p[cf_out]",
+				"-map", "[cf_out]",
+				"-c:v", "libx264",
+				"-preset", "ultrafast",
+				"-pix_fmt", "yuv420p",
+				"-an",
+				trimmedPath,
+			}
+		} else {
+			// Scale & Crop to 9:16 (1080x1920) and trim
+			filter := "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p"
+			args = []string{
+				"-y",
+				"-t", fmt.Sprintf("%.2f", clipDuration),
+				"-i", inputPath,
+				"-vf", filter,
+				"-c:v", "libx264",
+				"-preset", "ultrafast",
+				"-pix_fmt", "yuv420p",
+				"-an",
+				trimmedPath,
+			}
 		}
 
 		cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
@@ -392,6 +428,15 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 // El string NO lleva prefijo `[0:v]` ni etiqueta final: quien lo use debe
 // anteponer la etiqueta de entrada y encadenar (`,drawtext…`) o etiquetar la
 // salida según su contexto (`-vf`, `-filter_complex`, dentro de buildRenderArgs).
+// imageClipExtRe detecta si una URL de "clip" apunta en realidad a una imagen
+// (el Editor de video del front permite importar una imagen en el slot de
+// video), mirando la extensión del path — ignora query string.
+var imageClipExtRe = regexp.MustCompile(`(?i)\.(jpe?g|png|webp|gif)(\?|$)`)
+
+func isImageClipURL(u string) bool {
+	return imageClipExtRe.MatchString(u)
+}
+
 func coverImageFilter(dur int) string {
 	if dur < 1 {
 		dur = 1
@@ -786,10 +831,10 @@ func layoutFor(template string) overlayLayout {
 		return overlayLayout{
 			boxY: "ih-604", boxH: "604",
 			catDotY: "h-525", catTextY: "h-524",
-			headY:           "h-454",
-			headYOffset:     454,
-			headLineSpacing: 18,
-			logoY:           92,
+			headY:             "h-454",
+			headYOffset:       454,
+			headLineSpacing:   18,
+			logoY:             92,
 			showPromo:         true,
 			promoWidth:        560,
 			promoBottomMargin: 34,

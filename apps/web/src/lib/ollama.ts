@@ -143,7 +143,7 @@ export async function rewriteNewsWithOllamaCloud(
 ⚠️ PROTOCOLO ESTRICTO DE PROTECCIÓN LEGAL Y DERECHOS DE AUTOR:
 1. PROHIBICIÓN TOTAL DE PLAGIO Y COPIA TEXTUAL: Está TERMINANTEMENTE PROHIBIDO copiar oraciones textuales, frases idénticas, estructuras o giros lingüísticos del medio original (${sourceName}). La copia literal o el parafraseo cercano constituye una violación de derechos de autor y está penado por la ley.
 2. REESCRITURA 100% ORIGINAL DESDE CERO: Tu labor periodística consiste en extraer ÚNICAMENTE los HECHOS CRUDOS (qué ocurrió, quiénes están involucrados, lugares de Puerto Rico, cifras, fechas y medidas oficiales) y REDACTAR UN ARTÍCULO COMPLETAMENTE NUEVO con la voz, estilo, vocabulario y estructura propia de Prensa Abierta.
-3. AISLAMIENTO TOTAL DE MARCA: NUNCA menciones nombres de medios de la competencia (El Nuevo Día, Primera Hora, El Vocero, NotiCel, Metro PR, Telenoticias, Telemundo, WAPA, Univision, etc.) ni a periodistas o reporteros ajenos. El artículo debe leerse como una cobertura propia de Prensa Abierta.
+3. AISLAMIENTO TOTAL DE MARCA: NUNCA menciones nombres de medios de la competencia (El Nuevo Día, Primera Hora, El Vocero, NotiCel, Metro PR, La Perla del Sur, Radio Isla, El Calce, Telenoticias, Telemundo, WAPA, Univision, etc.) ni a periodistas o reporteros ajenos. El artículo debe leerse como una cobertura propia de Prensa Abierta.
 
 ESTRUCTURA DE PUBLICACIÓN REQUERIDA:
 

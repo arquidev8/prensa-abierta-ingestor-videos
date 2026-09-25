@@ -1,6 +1,28 @@
 version: '3.8'
 
 services:
+  # Usuarios, roles y contador diario de videos viven acá (el resto de los datos sigue en
+  # services/engine/data). Las migraciones de esquema las aplica el Engine al arrancar.
+  postgres:
+    image: postgres:16-alpine
+    container_name: prensa_abierta_postgres
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-prensa}
+      # Sin valor por defecto a propósito: define POSTGRES_PASSWORD en el .env (ver .env.example).
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en el .env (ver .env.example)}
+      - POSTGRES_DB=${POSTGRES_DB:-prensa_abierta}
+    ports:
+      # Solo loopback: sirve para psql/GUIs desde tu máquina, nunca queda expuesto a la red.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prensa} -d ${POSTGRES_DB:-prensa_abierta}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   engine:
     build:
       context: ./services/engine
@@ -14,12 +36,50 @@ services:
       - ASSETS_DIR=/app/assets
       # Tamaño del worker pool que limita cuántos renders de FFmpeg corren en paralelo
       - VIDEO_RENDER_WORKERS=${VIDEO_RENDER_WORKERS:-2}
-      - FFMPEG_PATH=${FFMPEG_PATH}
-      - LOGO_URL=${LOGO_URL}
-      - PROMO_IMAGE_URL=${PROMO_IMAGE_URL}
+      # Matcher "misma noticia en otros medios" (solo entre las 5 fuentes RSS ya
+      # scrapeadas): score mínimo 0..1 para enlazar dos noticias y ventana horaria
+      # (en cualquier dirección) fuera de la cual no se comparan. Ajustables sin
+      # recompilar mientras se afina con datos reales; ver pkg/matcher.
+      - RELATED_NEWS_SIMILARITY_THRESHOLD=${RELATED_NEWS_SIMILARITY_THRESHOLD:-0.12}
+      - RELATED_NEWS_WINDOW_HOURS=${RELATED_NEWS_WINDOW_HOURS:-48}
+      - FFMPEG_PATH=${FFMPEG_PATH:-}
+      # URLs públicas del logo / banner en Cloudinary (banco de medios migrado).
+      # Opcionales: si están vacías, el Engine usa el archivo local en
+      # assets/logos como hasta ahora. Se descargan una sola vez al arrancar.
+      - LOGO_URL=${LOGO_URL:-}
+      - PROMO_IMAGE_URL=${PROMO_IMAGE_URL:-}
+      # Superadmin inicial: solo se siembra si data/users.json está vacío (primer arranque).
+      # Sin contraseña, el Engine genera una aleatoria y la imprime UNA vez en `docker logs`.
+      - SEED_SUPERADMIN_EMAIL=${SEED_SUPERADMIN_EMAIL:-}
+      - SEED_SUPERADMIN_PASSWORD=${SEED_SUPERADMIN_PASSWORD:-}
+      # Conexión a PostgreSQL. Por defecto apunta al servicio `postgres` de este compose; para una base
+      # gestionada (RDS, Supabase, etc.) define DATABASE_URL en el .env. Si la contraseña lleva
+      # caracteres especiales, en la URL deben ir codificados (%40 para @, etc.).
+      - DATABASE_URL=${DATABASE_URL:-postgres://${POSTGRES_USER:-prensa}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-prensa_abierta}?sslmode=disable}
+      # Zona horaria que define cuándo empieza el "día" del límite diario de videos.
+      - USAGE_TIMEZONE=${USAGE_TIMEZONE:-America/Puerto_Rico}
+      # Clave para firmar los access tokens (JWT, duran 15 min). Sin ella, el Engine genera
+      # una aleatoria al arrancar; importa sobre todo si corrés más de una instancia del
+      # Engine a la vez (deben compartir la misma clave para validar el token de la otra).
+      # Nota aparte: tanto el access como el refresh token viven solo en memoria (igual que
+      # antes de este cambio), así que un reinicio del contenedor de todos modos cierra
+      # todas las sesiones activas — fijar JWT_SECRET no evita eso, solo la vuelve estable.
+      - JWT_SECRET=${JWT_SECRET:-}
+      # Locución de los videos (ElevenLabs text-to-speech). Sin key, los videos salen mudos.
+      # El audio se cachea en data/voice_cache: el mismo texto no se paga dos veces.
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-}
+      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:-}
+      - ELEVENLABS_SPEED=${ELEVENLABS_SPEED:-}
+      - ELEVENLABS_STABILITY=${ELEVENLABS_STABILITY:-}
+      - ELEVENLABS_SIMILARITY_BOOST=${ELEVENLABS_SIMILARITY_BOOST:-}
+      - ELEVENLABS_STYLE=${ELEVENLABS_STYLE:-}
     volumes:
       - ./services/engine/data:/app/data
       - ./assets:/app/assets
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   web:
@@ -27,7 +87,10 @@ services:
       context: ./apps/web
       dockerfile: Dockerfile
       args:
-        # Usado por el bundle del navegador (build-time); debe ser la URL publicada en el host
+        # Usado por el bundle del navegador (build-time); debe ser la URL publicada en el host.
+        # OJO: el servicio `engine` de abajo publica su puerto como "8081:8080" (host:contenedor),
+        # así que el navegador debe apuntar a 8081, no a 8080 (ese es el puerto interno del
+        # contenedor, inalcanzable desde el host salvo que coincida con el mapeo de `ports`).
         - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8081}
     container_name: prensa_abierta_web
     ports:
@@ -37,14 +100,18 @@ services:
       # (Next.js incrusta NEXT_PUBLIC_* en build-time en todo el bundle, incluido el servidor)
       - NEXT_PUBLIC_ENGINE_URL=${NEXT_PUBLIC_ENGINE_URL:-http://localhost:8081}
       # Usado por el código de servidor (lib/engine.ts) en runtime real; DNS interno de docker
+      # (dentro de la red de compose, el Engine SÍ escucha en su puerto de contenedor, 8080 —
+      # esto no tiene relación con el "8081:8080" de arriba, que es solo el mapeo hacia el host)
       - ENGINE_INTERNAL_URL=${ENGINE_INTERNAL_URL:-http://engine:8080}
       # URL por la que el Go Engine puede alcanzar a ESTE servicio (DNS interno de docker),
       # usada para construir clip_urls que el Engine descarga (ver process-news/route.ts y
       # render-video/route.ts). NO puede ser localhost: eso apuntaría al propio contenedor Engine.
+      # El contenedor `web` escucha en el puerto 3000 (ver apps/web/Dockerfile: ENV PORT=3000)
+      # — nada escucha en 8080 ahí adentro, así que NO debe ser ese puerto.
       - WEB_INTERNAL_URL=${WEB_INTERNAL_URL:-http://web:3000}
-      - OLLAMA_CLOUD_BASE_URL=${OLLAMA_CLOUD_BASE_URL}
+      - OLLAMA_CLOUD_BASE_URL=${OLLAMA_CLOUD_BASE_URL:-https://ollama.com/v1}
       - OLLAMA_CLOUD_API_KEY=${OLLAMA_CLOUD_API_KEY}
-      - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-glm-5.2}
       - WP_DRY_RUN=${WP_DRY_RUN:-true}
       - WP_BASE_URL=${WP_BASE_URL}
       - WP_USERNAME=${WP_USERNAME}
@@ -55,3 +122,6 @@ services:
     depends_on:
       - engine
     restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -5,8 +5,8 @@
  */
 
 const COMPETITOR_PATTERNS = [
-  /\b(según|segun|de acuerdo con|reportó|informó|consignó|publicó|reseñó)\s+(el nuevo d[ií]a|primera hora|el vocero|noticel|metro puerto rico|metro pr|telenoticias|telemundo|wapa|univisi[oó]n|noticentro|el vocero de puerto rico)\b/gi,
-  /\b(el nuevo d[ií]a|primera hora|el vocero|noticel|metro puerto rico|metro pr|telenoticias|telemundo pr|wapa tv|wapa deportes|univisi[oó]n pr)\b/gi,
+  /\b(según|segun|de acuerdo con|reportó|informó|consignó|publicó|reseñó)\s+(el nuevo d[ií]a|primera hora|el vocero|noticel|metro puerto rico|metro pr|telenoticias|telemundo|wapa|univisi[oó]n|noticentro|el vocero de puerto rico|la perla del sur|radio isla|el calce)\b/gi,
+  /\b(el nuevo d[ií]a|primera hora|el vocero|noticel|metro puerto rico|metro pr|telenoticias|telemundo pr|wapa tv|wapa deportes|univisi[oó]n pr|la perla del sur|radio isla(?: 1320)?|el calce)\b/gi,
   /\b(a preguntas de\s+[a-záéíóúñ\s]+de\s+(metro|el nuevo d[ií]a|primera hora|el vocero|noticel))\b/gi,
   /\b(según informó la periodista|según reportó el periodista|según supo)\s+[a-záéíóúñ\s]+,\s*de\s+[a-záéíóúñ\s]+/gi,
 ];

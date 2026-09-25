@@ -2,6 +2,18 @@ import type { VideoDirection } from './videoDirection';
 
 export type { VideoDirection };
 
+/** Otro medio (de los ya scrapeados) que publicó, según el matcher léxico del
+ * Engine, la misma noticia que un RawNews dado. Ver related_sources abajo. */
+export interface RelatedSource {
+  source_id: string;
+  source_name: string;
+  source_logo_url?: string;
+  url: string;
+  title: string;
+  published_at: string;
+  similarity: number; // 0..1
+}
+
 export interface RawNews {
   id: string;
   source_id: string;
@@ -17,6 +29,21 @@ export interface RawNews {
   category?: string;
   status: 'pending' | 'processing' | 'processed' | 'rejected';
   hash: string;
+  /** Otros medios que publicaron la misma noticia. Ausente en noticias
+   * ingeridas antes de esta feature hasta que corra el backfill del Engine. */
+  related_sources?: RelatedSource[];
+}
+
+/** Un diario/medio configurado en el scraper del Engine (pkg/scraper/sources.go). */
+export interface NewsSource {
+  id: string;
+  name: string;
+  base_url: string;
+  rss_url: string;
+  category: string;
+  enabled: boolean;
+  poll_minutes: number;
+  logo_url?: string;
 }
 
 export interface ProcessedNews {
@@ -58,6 +85,8 @@ export interface VideoJob {
   output_path?: string;
   output_url?: string;
   error?: string;
+  /** Estado de la locución: 'ok', 'disabled' (sin API key), 'failed: …' o vacío (no se pidió). */
+  voice_status?: string;
   created_at: string;
   completed_at?: string;
 }

@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import toast from 'react-hot-toast';
 import {
   Sparkles,
   Video,
@@ -22,6 +23,8 @@ import VideoPlayerPreview from '@/components/VideoPlayerPreview';
 import StructuredArticleReader from '@/components/StructuredArticleReader';
 import EngineOfflineBanner from '@/components/EngineOfflineBanner';
 import { fetchFromEngine } from '@/lib/engineClient';
+import { authHeaderFresh } from '@/lib/authClient';
+import { notifyVideoUsageChanged } from '@/lib/videoUsage';
 import { inferNewsCategory } from '@/lib/newsCategorizer';
 
 // Categoría para el pipeline de video: se infiere del título/cuerpo (igual que en
@@ -90,18 +93,23 @@ export default function AutopilotHubPage() {
   const handleDownloadRealVideo = async (item: ProcessedNews) => {
     try {
       setRenderingId(item.id);
+      setTimeout(notifyVideoUsageChanged, 3000); // el Engine cuenta el render al encolarlo
       // Timeout defensivo del lado del cliente: el servidor ya acota su propia espera
       // (MAX_WAIT_MS = 190s) al pollear el job del Go Engine, pero este límite adicional
       // garantiza que el botón nunca quede "generando" para siempre ante un fallo de
       // red, un proxy colgado, etc.
       const res = await fetch('/api/render-video', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        // Renueva el access token antes si está por vencer (dura 15 min): esta ruta no
+        // tiene el reintento automático que sí tiene engineRequest().
+        headers: { 'Content-Type': 'application/json', ...(await authHeaderFresh()) },
         body: JSON.stringify({
           newsId: item.id || `news_${Date.now()}`,
           headline: item.title,
           category: videoCategoryFor(item),
           imageUrl: item.featured_image_url,
+          // Arranque de la nota: el Engine lo locuta junto a categoría + titular.
+          body: (item.content_html || '').slice(0, 2000),
           // Capa 3: sin duración fija, /api/render-video usa la de la dirección de
           // video (o su default de 12s); las queries de Pexels y la plantilla
           // también salen de acá.
@@ -120,6 +128,7 @@ export default function AutopilotHubPage() {
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
+        toast.success('Video descargado correctamente.');
       } else {
         alert(data.error || 'Error al generar video');
       }
@@ -133,6 +142,7 @@ export default function AutopilotHubPage() {
       );
     } finally {
       setRenderingId(null);
+      notifyVideoUsageChanged();
     }
   };
 

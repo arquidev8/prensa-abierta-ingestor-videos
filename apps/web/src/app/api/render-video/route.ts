@@ -3,6 +3,7 @@ import { resolveComposition } from '@/lib/contentLibrary';
 import { searchPexelsVideos, searchPexelsPhotos } from '@/lib/pexels';
 import { requestVideoRender, checkVideoJob } from '@/lib/engine';
 import { sanitizeVideoDirection, VideoDirection } from '@/lib/videoDirection';
+import { buildVoiceScript } from '@/lib/voiceScript';
 
 // Único pipeline de renderizado de video: el Go Engine (services/engine), con su
 // worker pool de tamaño acotado. Antes existía una segunda implementación de FFmpeg
@@ -31,6 +32,14 @@ function sleep(ms: number) {
 }
 
 export async function POST(req: NextRequest) {
+  // El token de la sesión viaja navegador → esta ruta → Go Engine, que verifica el usuario y su
+  // límite diario. Sin token se corta acá, antes de gastar trabajo resolviendo clips.
+  const authHeader = req.headers.get('authorization') || '';
+  const authToken = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : '';
+  if (!authToken) {
+    return NextResponse.json({ error: 'Inicia sesión para generar videos.' }, { status: 401 });
+  }
+
   try {
     const body = await req.json();
     const {
@@ -45,6 +54,7 @@ export async function POST(req: NextRequest) {
       customImageUrl,
       customClipUrl,
       videoDirection,
+      body: articleBody,
     } = body as {
       newsId?: string;
       headline?: string;
@@ -71,6 +81,8 @@ export async function POST(req: NextRequest) {
       customImageUrl?: string;
       customClipUrl?: string;
       videoDirection?: VideoDirection;
+      // Cuerpo de la nota (HTML o texto): de acá sale el arranque que se locuta.
+      body?: string;
     };
 
     if (!headline) {
@@ -261,6 +273,26 @@ export async function POST(req: NextRequest) {
         `plantilla=${effectiveTemplate} dur=${effectiveDuration}s base=${imageOnly ? 'imagen' : 'video'} ${aiClipsNote}`
     );
 
+    // ── Locución: categoría + titular + arranque de la nota, dentro del tiempo del video ──
+    const voice = buildVoiceScript({
+      category,
+      headline,
+      body: articleBody,
+      durationSec: effectiveDuration,
+    });
+    if (voice) {
+      console.log(
+        `[render-video][voz] guion listo: ${voice.words}/${voice.budgetWords} palabras para ${effectiveDuration}s ` +
+          `(categoría=${voice.parts.category ? 'sí' : 'no'}, titular${voice.parts.headlineTruncated ? ' TRUNCADO' : ' completo'}, ` +
+          `oraciones de la nota=${voice.parts.bodySentences})`
+      );
+      console.log(`[render-video][voz] texto: "${voice.text}"`);
+    } else {
+      console.log(
+        `[render-video][voz] sin locución (duración ${effectiveDuration}s sin presupuesto de palabras o titular vacío)`
+      );
+    }
+
     const { job_id } = await requestVideoRender({
       news_id: effectiveNewsId,
       headline,
@@ -281,7 +313,8 @@ export async function POST(req: NextRequest) {
           : effectiveTemplate === 'app-promo'
             ? 'app-promo'
             : 'standard',
-    });
+      voice_text: voice?.text,
+    }, authToken);
 
     // El Engine renderiza de forma asíncrona (worker pool); hacemos polling acotado
     // en vez de esperar indefinidamente, así el fetch del cliente SIEMPRE resuelve
@@ -291,6 +324,9 @@ export async function POST(req: NextRequest) {
       const job = await checkVideoJob(job_id);
 
       if (job.status === 'completed' && job.output_url) {
+        if (voice) {
+          console.log(`[render-video][voz] job ${job_id} completado, voice_status=${job.voice_status || '(vacío)'}`);
+        }
         // Se devuelve una URL same-origin (proxy /api/video/download) en vez del link
         // directo al Engine: el atributo `download` de un <a> se ignora en URLs
         // cross-origin salvo que el servidor mande `Content-Disposition: attachment`,
@@ -310,6 +346,7 @@ export async function POST(req: NextRequest) {
       }
 
       if (job.status === 'failed') {
+        console.warn(`[render-video] job ${job_id} falló: ${job.error}`);
         return NextResponse.json(
           { error: job.error || 'El Go Engine no pudo renderizar el video' },
           { status: 502 }
@@ -329,9 +366,12 @@ export async function POST(req: NextRequest) {
     );
   } catch (error: any) {
     console.error('Error generando video real (Go Engine):', error);
+    // Sesión inválida (401), usuario inactivo (403) o límite diario alcanzado (429): son respuestas
+    // esperadas del Engine, se devuelven con su status y mensaje.
+    const engineStatus = [401, 403, 429].includes(error?.status) ? error.status : 500;
     return NextResponse.json(
       { error: error?.message || 'Error al generar video' },
-      { status: 500 }
+      { status: engineStatus }
     );
   }
 }
