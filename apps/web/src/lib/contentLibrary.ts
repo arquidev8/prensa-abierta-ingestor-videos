@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import cloudinaryManifest from '@/data/cloudinary-manifest.json';
 
 export interface CategoryVideoInfo {
@@ -85,21 +86,53 @@ export function getAssetsContenidoDir(): string {
   return path.join(base, 'contenido');
 }
 
-// Resuelve la ruta absoluta a assets/uploads (archivos importados por el usuario
-// desde el "Editor de video" — ver /api/media/upload). Es hermana de
-// assets/contenido, en el mismo volumen `./assets` que comparten los contenedores
-// `web` y `engine` (docker-compose.yml), así que sobreviven a que se recreen los
-// contenedores y el Engine podría leerlos directo del disco si hiciera falta.
-//
-// A propósito NO se sirven desde `public/`: en el build "standalone" de Next.js
-// (usado en el Dockerfile) el servidor resuelve el set de archivos estáticos de
-// `public/` una sola vez al arrancar, así que un archivo escrito ahí en runtime
-// (después de que el proceso ya inició) nunca se vuelve servible — 404 permanente
-// hasta reconstruir la imagen. Por eso se sirven vía un route handler dinámico
-// (`/api/media/uploads/[filename]`), que sí lee el disco en cada request.
+// Resuelve la ruta absoluta a assets/uploads con fallback automático a directorio temporal
+// en caso de restricciones de permisos en el volumen Docker montado por root.
 export function getAssetsUploadsDir(): string {
+  if (process.env.UPLOADS_DIR) {
+    return process.env.UPLOADS_DIR;
+  }
+
   const base = getAssetsBaseDir();
-  return path.join(base, 'uploads');
+  const primaryUploads = path.join(base, 'uploads');
+
+  try {
+    if (!fs.existsSync(primaryUploads)) {
+      fs.mkdirSync(primaryUploads, { recursive: true });
+    }
+    fs.accessSync(primaryUploads, fs.constants.W_OK);
+    return primaryUploads;
+  } catch {
+    // Si el volumen /app/assets pertenece a root y el usuario node no puede crear 'uploads',
+    // guardamos en os.tmpdir() donde siempre hay permisos de escritura.
+    const fallback = path.join(os.tmpdir(), 'prensa_assets_uploads');
+    try {
+      if (!fs.existsSync(fallback)) {
+        fs.mkdirSync(fallback, { recursive: true });
+      }
+    } catch (e) {
+      console.warn('[Uploads] Error creando fallback temporal:', e);
+    }
+    return fallback;
+  }
+}
+
+// Busca un archivo subido comprobando tanto la ruta principal como la de fallback
+export function getUploadedFilePath(filename: string): string {
+  const dirs = [
+    process.env.UPLOADS_DIR,
+    path.join(getAssetsBaseDir(), 'uploads'),
+    path.join(os.tmpdir(), 'prensa_assets_uploads'),
+  ].filter(Boolean) as string[];
+
+  for (const d of dirs) {
+    const full = path.join(d, filename);
+    if (fs.existsSync(full)) {
+      return full;
+    }
+  }
+
+  return path.join(getAssetsUploadsDir(), filename);
 }
 
 // Normaliza texto eliminando acentos y caracteres especiales para comparaciones

@@ -2,17 +2,17 @@ import { NextRequest } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
-import { getAssetsUploadsDir } from '@/lib/contentLibrary';
-
+import { getUploadedFilePath } from '@/lib/contentLibrary';
+ 
 export const dynamic = 'force-dynamic';
-
+ 
 // Sirve los archivos importados por el usuario desde el "Editor de video"
 // (assets/uploads, escritos por /api/media/upload) vía un route handler dinámico
 // en vez de `public/`: el build "standalone" de Next.js (usado en el Dockerfile)
 // resuelve el set de archivos estáticos de `public/` una sola vez al arrancar, así
 // que un archivo agregado ahí en runtime nunca llega a ser servible (404
 // permanente) — un route handler sí lee el disco en cada request.
-
+ 
 const IMAGE_TYPES: Record<string, string> = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
@@ -20,27 +20,27 @@ const IMAGE_TYPES: Record<string, string> = {
   '.webp': 'image/webp',
   '.gif': 'image/gif',
 };
-
+ 
 const VIDEO_TYPES: Record<string, string> = {
   '.mp4': 'video/mp4',
   '.mov': 'video/quicktime',
   '.webm': 'video/webm',
   '.mkv': 'video/x-matroska',
 };
-
+ 
 // Nombres generados por /api/media/upload: `<uuid v4>.<ext>`. Se valida el
 // patrón exacto antes de tocar el filesystem (nunca se confía en el nombre de
 // la URL para construir una ruta sin validar — evita path traversal).
 const SAFE_FILENAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z0-9]{2,5}$/i;
-
+ 
 export async function GET(req: NextRequest, context: { params: Promise<{ filename: string }> }) {
   try {
     const { filename } = await context.params;
     if (!SAFE_FILENAME.test(filename)) {
       return new Response('No encontrado', { status: 404 });
     }
-
-    const filePath = path.join(getAssetsUploadsDir(), filename);
+ 
+    const filePath = getUploadedFilePath(filename);
     if (!fs.existsSync(filePath)) {
       return new Response('No encontrado', { status: 404 });
     }
