@@ -50,11 +50,15 @@ func GetDefaultPRSources() []models.Source {
 			ID:          "noticel",
 			Name:        "NotiCel",
 			BaseURL:     "https://www.noticel.com",
-			RSSURL:      "https://www.noticel.com/arc/outboundfeeds/rss/?outputType=xml",
+			// NotiCel corre WordPress, no Arc: la ruta /arc/outboundfeeds/… no existe y su
+			// WordPress responde 200 con un feed sin notas, así que nunca se ingirió nada.
+			RSSURL:      "https://www.noticel.com/feed/",
 			Category:    "Investigación & Política",
 			Enabled:     true,
 			PollMinutes: 5,
 			LogoURL:     faviconURL("www.noticel.com"),
+			// Solo 2 de cada 10 notas traen imagen en el RSS; el resto sale de su API REST.
+			WordPressREST: true,
 		},
 		{
 			ID:          "metro-pr",
