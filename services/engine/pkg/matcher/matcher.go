@@ -35,7 +35,10 @@ type Config struct {
 	// diferencia horaria (en cualquier dirección) — evita comparar contra todo
 	// el historial y reduce falsos positivos de temas recurrentes en fechas lejanas.
 	WindowHours int
-	// MaxMatches trunca cuántas fuentes relacionadas se guardan por noticia.
+	// MaxMatches trunca cuántas fuentes relacionadas se guardan por noticia. Se guarda a lo
+	// sumo una por medio, así que el máximo útil es la cantidad de fuentes de
+	// scraper.GetDefaultPRSources() (10 hoy); con un tope menor, una nota muy cubierta
+	// ocultaría medios que sí la publicaron. Si se agregan fuentes, hay que subirlo.
 	MaxMatches int
 }
 
@@ -48,7 +51,7 @@ type Config struct {
 // pero es solo un punto de partida: se espera afinarlo con datos reales vía
 // RELATED_NEWS_SIMILARITY_THRESHOLD una vez corriendo contra los 5 feeds.
 func DefaultConfig() Config {
-	return Config{Threshold: 0.12, WindowHours: 48, MaxMatches: 6}
+	return Config{Threshold: 0.12, WindowHours: 48, MaxMatches: 10}
 }
 
 // Match es un candidato de pkg/storage que resultó "la misma noticia" que el
