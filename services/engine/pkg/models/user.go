@@ -93,13 +93,8 @@ func CanManageUser(callerRole, targetRole Role) bool {
 // RefreshToken es un token opaco de larga vida (ver refreshTokenTTL en
 // pkg/storage/user_store.go, 5 días) que el cliente cambia por un access
 // token (JWT, ver pkg/auth, vive 15 min) nuevo vía POST /api/auth/refresh.
-// Vive solo en memoria (no se persiste a disco): reiniciar el servidor
-// cierra todas las sesiones activas, lo cual es un default aceptable/
-// deseable de seguridad para esta herramienta interna. Es de un solo uso:
-// cada refresh lo invalida y emite uno nuevo con un string distinto
-// (rotación), pero conserva el mismo ExpiresAt original — la sesión nunca
-// dura más de refreshTokenTTL desde el login, sin importar cuántas veces se
-// refresque el access token mientras tanto.
+// Su hash SHA-256 se persiste en PostgreSQL; cada token es de un solo uso: al
+// refrescarlo se reemplaza por uno nuevo conservando el vencimiento original.
 type RefreshToken struct {
 	Token     string    `json:"token"`
 	UserID    string    `json:"user_id"`

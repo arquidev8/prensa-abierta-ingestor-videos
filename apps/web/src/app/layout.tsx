@@ -1,9 +1,21 @@
 import './globals.css';
 import type { Metadata } from 'next';
+import { League_Spartan } from 'next/font/google';
 import Link from 'next/link';
 import HeaderNav from '@/components/HeaderNav';
 import AppToaster from '@/components/AppToaster';
 import AuthGate from '@/components/AuthGate';
+
+// Fuente del titular del Reel 9:16 (ver "Estilo del titular" en el Editor de
+// video, dashboard/page.tsx). Solo cosmética para el panel de controles — el
+// render real usa el .ttf bundleado en assets/fonts/ (ver fontFileFor() en el
+// Go Engine), no esta webfont.
+const leagueSpartan = League_Spartan({
+  subsets: ['latin'],
+  weight: ['700', '900'],
+  variable: '--font-league-spartan',
+  display: 'swap',
+});
 
 export const metadata: Metadata = {
   title: 'Prensa Abierta | Pipeline Editorial & Video PR',
@@ -17,7 +29,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="es">
-      <body className="bg-[#F8FAFC] text-slate-900 min-h-screen flex flex-col antialiased bg-grid-mesh relative selection:bg-[#FF5500] selection:text-white">
+      <body className={`${leagueSpartan.variable} bg-[#F8FAFC] text-slate-900 min-h-screen flex flex-col antialiased bg-grid-mesh relative selection:bg-[#FF5500] selection:text-white`}>
         <AppToaster />
 
         {/* Subtle Brand Orange Radial Glow in Background */}

@@ -2,7 +2,8 @@
 
 import { useCallback, useRef, useState } from 'react';
 import type { VideoDirection } from '@/lib/videoDirection';
-import { authHeaderFresh } from '@/lib/authClient';
+import type { VideoStyle } from '@/lib/types';
+import { fetchWithSession } from '@/lib/authClient';
 import { notifyVideoUsageChanged } from '@/lib/videoUsage';
 
 export type RenderStatus = 'idle' | 'rendering' | 'ready' | 'failed';
@@ -11,6 +12,7 @@ export interface RenderState {
   status: RenderStatus;
   url?: string;
   error?: string;
+  voiceStatus?: string;
 }
 
 export interface RenderParams {
@@ -31,6 +33,12 @@ export interface RenderParams {
   // inicializa `background`/`template` desde acá; el resto (duración, queries de
   // Pexels) lo aplica /api/render-video.
   videoDirection?: VideoDirection;
+  // Overrides granulares del "Editor de video" (tipografía, colores, posición,
+  // logo, banner) sobre el layout de `template`. Ausente = layout por defecto,
+  // el render sale idéntico al que había antes de esta feature.
+  style?: VideoStyle;
+  // Guion de locución personalizado editado por el usuario en el Editor de video.
+  voiceText?: string;
 }
 
 const IDLE_STATE: RenderState = { status: 'idle' };
@@ -57,6 +65,11 @@ function buildKey(p: RenderParams): string {
     dirSig,
     // Si cambia la nota (ej. "Redactar de nuevo") cambia la locución: firma corta del cuerpo.
     (p.body || '').length + ':' + (p.body || '').slice(0, 60),
+    // Cualquier ajuste del Editor de estilo (tipografía, colores, posición, logo,
+    // banner) produce una clave distinta: no reusa el .mp4 de otra combinación.
+    p.style ? JSON.stringify(p.style) : '',
+    // Si el usuario editó el guion de locución, produce una clave distinta
+    p.voiceText || '',
   ].join('::');
 }
 
@@ -67,6 +80,7 @@ function buildKey(p: RenderParams): string {
  */
 export function useVideoRenderCache() {
   const statesRef = useRef<Map<string, RenderState>>(new Map());
+  const activeFetchesRef = useRef<Map<string, Promise<string | null>>>(new Map());
   const [, forceUpdate] = useState(0);
 
   const getState = useCallback((params: RenderParams | null): RenderState => {
@@ -74,72 +88,100 @@ export function useVideoRenderCache() {
     return statesRef.current.get(buildKey(params)) || IDLE_STATE;
   }, []);
 
-  const ensureRendered = useCallback((params: RenderParams | null) => {
-    if (!params || !params.headline) return;
-    const key = buildKey(params);
-    const existing = statesRef.current.get(key);
-    if (existing && (existing.status === 'rendering' || existing.status === 'ready')) return;
+  const ensureRendered = useCallback(
+    async (params: RenderParams | null, options?: { force?: boolean }): Promise<string | null> => {
+      if (!params || !params.headline) return null;
+      const key = buildKey(params);
+      const existing = statesRef.current.get(key);
 
-    statesRef.current.set(key, { status: 'rendering' });
-    forceUpdate((n) => n + 1);
+      if (!options?.force) {
+        if (existing?.status === 'ready' && existing.url) {
+          return existing.url;
+        }
+        if (activeFetchesRef.current.has(key)) {
+          return await activeFetchesRef.current.get(key)!;
+        }
+      }
 
-    // El Engine cuenta el render apenas lo encola: se refresca el contador del navbar poco después
-    // de arrancar (sin esperar a que termine el render) y de nuevo al finalizar.
-    setTimeout(notifyVideoUsageChanged, 3000);
+      // Si es forzado o clave nueva para esta noticia, limpiar cualquier render previo de esta noticia
+      if (options?.force) {
+        for (const k of Array.from(statesRef.current.keys())) {
+          if (k.startsWith(params.newsId + '::')) {
+            statesRef.current.delete(k);
+          }
+        }
+      }
 
-    (async () => {
-      try {
-        // Timeout defensivo del lado del cliente: el servidor ya acota su propia
-        // espera (MAX_WAIT_MS = 190s) al pollear el job del Go Engine; este límite
-        // le da margen para que ese timeout/resultado llegue antes de abortar el
-        // fetch, en vez de cortar la conexión primero.
-        const res = await fetch('/api/render-video', {
-          method: 'POST',
-          // Renueva el access token antes si está por vencer (dura 15 min) en vez de
-          // arriesgarse a un 401 en medio de un render largo — esta ruta no tiene el
-          // reintento automático que sí tiene engineRequest().
-          headers: { 'Content-Type': 'application/json', ...(await authHeaderFresh()) },
-          body: JSON.stringify({
-            newsId: params.newsId,
-            headline: params.headline,
-            category: params.category,
-            imageUrl: params.imageUrl,
-            background: params.background,
-            template: params.template,
-            customImageUrl: params.customImageUrl,
-            customClipUrl: params.customClipUrl,
-            // Sin duración explícita del modal, /api/render-video usa la de la
-            // dirección de video (o su default de 12s).
-            duration: params.duration,
-            videoDirection: params.videoDirection,
-            // Solo el arranque: el guion de voz nunca usa más que unas decenas de palabras.
-            body: (params.body || '').slice(0, 2000),
-          }),
-          signal: AbortSignal.timeout(205_000),
-        });
-        const data = await res.json();
-        if (res.ok && data.success && data.videoUrl) {
-          statesRef.current.set(key, { status: 'ready', url: data.videoUrl });
-        } else {
+      statesRef.current.set(key, { status: 'rendering' });
+      forceUpdate((n) => n + 1);
+
+      setTimeout(notifyVideoUsageChanged, 3000);
+
+      const fetchPromise = (async (): Promise<string | null> => {
+        try {
+          const res = await fetchWithSession('/api/render-video', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              newsId: params.newsId,
+              headline: params.headline,
+              category: params.category,
+              imageUrl: params.imageUrl,
+              background: params.background,
+              template: params.template,
+              customImageUrl: params.customImageUrl,
+              customClipUrl: params.customClipUrl,
+              duration: params.duration,
+              videoDirection: params.videoDirection,
+              body: (params.body || '').slice(0, 2000),
+              style: params.style,
+              voiceText: params.voiceText,
+            }),
+            signal: AbortSignal.timeout(205_000),
+          });
+          const data = await res.json();
+          if (res.ok && data.success && data.videoUrl) {
+            statesRef.current.set(key, {
+              status: 'ready',
+              url: data.videoUrl,
+              ...(typeof data.voiceStatus === 'string' ? { voiceStatus: data.voiceStatus } : {}),
+            });
+            return data.videoUrl as string;
+          } else {
+            statesRef.current.set(key, {
+              status: 'failed',
+              error: data.error || 'Error al generar video',
+            });
+            return null;
+          }
+        } catch (e: any) {
+          const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
           statesRef.current.set(key, {
             status: 'failed',
-            error: data.error || 'Error al generar video',
+            error: timedOut
+              ? 'El render tardó demasiado y se canceló. Intenta de nuevo en unos segundos.'
+              : 'Hubo un error al procesar el video.',
           });
+          return null;
+        } finally {
+          activeFetchesRef.current.delete(key);
+          forceUpdate((n) => n + 1);
+          notifyVideoUsageChanged();
         }
-      } catch (e: any) {
-        const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
-        statesRef.current.set(key, {
-          status: 'failed',
-          error: timedOut
-            ? 'El render tardó demasiado y se canceló. Intenta de nuevo en unos segundos.'
-            : 'Hubo un error al procesar el video.',
-        });
-      } finally {
-        forceUpdate((n) => n + 1);
-        notifyVideoUsageChanged();
-      }
-    })();
-  }, []);
+      })();
 
-  return { getState, ensureRendered };
+      activeFetchesRef.current.set(key, fetchPromise);
+      return await fetchPromise;
+    },
+    []
+  );
+
+  const forceRender = useCallback(
+    async (params: RenderParams | null): Promise<string | null> => {
+      return await ensureRendered(params, { force: true });
+    },
+    [ensureRendered]
+  );
+
+  return { getState, ensureRendered, forceRender };
 }

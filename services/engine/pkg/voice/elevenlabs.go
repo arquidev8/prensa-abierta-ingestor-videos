@@ -53,6 +53,9 @@ type Client struct {
 	useSpeakerBoost bool
 	cacheDir        string
 	http            *http.Client
+	// El sintetizador se usa únicamente en pruebas; en producción ElevenLabs entrega
+	// el audio por HTTP con la misma ruta de caché.
+	synthesize func(context.Context, string) ([]byte, error)
 }
 
 // Defaults del perfil "News / Professional" de references/voice-settings.md: tono
@@ -71,9 +74,28 @@ const (
 // ELEVENLABS_SIMILARITY_BOOST (0.0–1.0, default 0.6), ELEVENLABS_STYLE (0.0–1.0, default 0.0).
 func NewClientFromEnv(cacheDir string) *Client {
 	key := strings.TrimSpace(os.Getenv("ELEVENLABS_API_KEY"))
+	return newClient(cacheDir, key, http.DefaultClient)
+}
+
+func NewClientFromCache(cacheDir, key string, synthesize func(context.Context, string) ([]byte, error)) *Client {
+	if strings.TrimSpace(key) == "" || synthesize == nil {
+		return nil
+	}
+	return newClientWithSynthesis(cacheDir, key, nil, synthesize)
+}
+
+func newClient(cacheDir, key string, httpClient *http.Client) *Client {
+	return newClientWithSynthesis(cacheDir, key, httpClient, nil)
+}
+
+func newClientWithSynthesis(cacheDir, key string, httpClient *http.Client, synthesize func(context.Context, string) ([]byte, error)) *Client {
+	key = strings.TrimSpace(key)
 	if key == "" {
 		log.Println("[Voice] ELEVENLABS_API_KEY no configurada: los videos se generarán sin locución.")
 		return nil
+	}
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: requestTimeout}
 	}
 
 	c := &Client{
@@ -86,7 +108,8 @@ func NewClientFromEnv(cacheDir string) *Client {
 		style:           envFloat("ELEVENLABS_STYLE", defaultStyle, 0.0, 1.0),
 		useSpeakerBoost: true,
 		cacheDir:        cacheDir,
-		http:            &http.Client{Timeout: requestTimeout},
+		http:            httpClient,
+		synthesize:      synthesize,
 	}
 	_ = os.MkdirAll(cacheDir, 0755)
 	log.Printf("[Voice] ✅ ElevenLabs listo (voz %s, modelo %s, velocidad %.2f, estabilidad %.2f, similitud %.2f, estilo %.2f).",
@@ -142,53 +165,61 @@ func (c *Client) Speech(ctx context.Context, text string) (string, error) {
 	log.Printf("[Voice] Caché MISS [%s]: sintetizando %d caracteres (voz=%s modelo=%s velocidad=%.2f estabilidad=%.2f similitud=%.2f estilo=%.2f) → %q",
 		key, len([]rune(text)), c.voiceID, c.modelID, c.speed, c.stability, c.similarityBoost, c.style, previewText(text, 120))
 
-	payload, _ := json.Marshal(map[string]any{
-		"text":     text,
-		"model_id": c.modelID,
-		"voice_settings": map[string]any{
-			"stability":         c.stability,
-			"similarity_boost":  c.similarityBoost,
-			"style":             c.style,
-			"speed":             c.speed,
-			"use_speaker_boost": c.useSpeakerBoost,
-		},
-		// Que cifras, fechas y siglas se lean como palabras.
-		"apply_text_normalization": "on",
-	})
+	var audio []byte
+	if c.synthesize != nil {
+		synthesized, err := c.synthesize(ctx, text)
+		if err != nil {
+			return "", fmt.Errorf("sintetizando audio de prueba: %w", err)
+		}
+		audio = synthesized
+	} else {
+		payload, _ := json.Marshal(map[string]any{
+			"text":     text,
+			"model_id": c.modelID,
+			"voice_settings": map[string]any{
+				"stability":         c.stability,
+				"similarity_boost":  c.similarityBoost,
+				"style":             c.style,
+				"speed":             c.speed,
+				"use_speaker_boost": c.useSpeakerBoost,
+			},
+			"apply_text_normalization": "on",
+		})
 
-	endpoint := fmt.Sprintf("%s/v1/text-to-speech/%s?output_format=mp3_44100_128", apiBase, url.PathEscape(c.voiceID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("xi-api-key", c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "audio/mpeg")
+		endpoint := fmt.Sprintf("%s/v1/text-to-speech/%s?output_format=mp3_44100_128", apiBase, url.PathEscape(c.voiceID))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("xi-api-key", c.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "audio/mpeg")
 
-	started := time.Now()
-	resp, err := c.http.Do(req)
-	if err != nil {
-		log.Printf("[Voice] ❌ [%s] Falló la petición a ElevenLabs tras %s: %v", key, time.Since(started).Round(time.Millisecond), err)
-		return "", fmt.Errorf("petición a ElevenLabs: %w", err)
-	}
-	defer resp.Body.Close()
+		started := time.Now()
+		resp, err := c.http.Do(req)
+		if err != nil {
+			log.Printf("[Voice] ❌ [%s] Falló la petición a ElevenLabs tras %s: %v", key, time.Since(started).Round(time.Millisecond), err)
+			return "", fmt.Errorf("petición a ElevenLabs: %w", err)
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		log.Printf("[Voice] ❌ [%s] ElevenLabs respondió %d en %s: %s (401=key inválida, 422=voice_id/model_id inválido, 429=límite/créditos)",
-			key, resp.StatusCode, time.Since(started).Round(time.Millisecond), strings.TrimSpace(string(body)))
-		return "", fmt.Errorf("ElevenLabs respondió %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			log.Printf("[Voice] ❌ [%s] ElevenLabs respondió %d en %s: %s (401=key inválida, 422=voice_id/model_id inválido, 429=límite/créditos)",
+				key, resp.StatusCode, time.Since(started).Round(time.Millisecond), strings.TrimSpace(string(body)))
+			return "", fmt.Errorf("ElevenLabs respondió %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
 
-	audio, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("leyendo audio: %w", err)
+		responseAudio, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("leyendo audio: %w", err)
+		}
+		audio = responseAudio
 	}
 	if len(audio) == 0 {
 		return "", fmt.Errorf("ElevenLabs devolvió audio vacío")
 	}
 
-	// Escritura atómica: un audio a medias jamás debe quedar como caché válida.
 	tmp := cached + ".tmp"
 	if err := os.WriteFile(tmp, audio, 0644); err != nil {
 		return "", err
@@ -197,7 +228,7 @@ func (c *Client) Speech(ctx context.Context, text string) (string, error) {
 		_ = os.Remove(tmp)
 		return "", err
 	}
-	log.Printf("[Voice] ✅ [%s] Audio recibido: %d bytes en %s, guardado en caché", key, len(audio), time.Since(started).Round(time.Millisecond))
+	log.Printf("[Voice] ✅ [%s] Audio recibido: %d bytes, guardado en caché", key, len(audio))
 	return cached, nil
 }
 

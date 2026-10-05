@@ -82,12 +82,15 @@ function serveResolvedMedia(req: NextRequest, media: { streamUrl: string; filePa
 // Busca un archivo puntual (category+file) entre las fuentes ya resueltas por
 // `getAllCategoryFolders()` (Cloudinary o disco local, lo que esté activo).
 function findMediaFile(category: string, fileName: string): MediaFile | null {
+  const norm = (s: string) => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+  const normCat = norm(category);
   const folder = getAllCategoryFolders().find(
-    (f) => f.name.toLowerCase() === category.toLowerCase()
+    (f) => norm(f.name) === normCat
   );
   if (!folder) return null;
   const all = [...folder.videos, ...folder.images];
-  return all.find((f) => f.fileName === fileName) || null;
+  const normFile = fileName.normalize();
+  return all.find((f) => f.fileName.normalize() === normFile) || null;
 }
 
 export async function GET(req: NextRequest) {

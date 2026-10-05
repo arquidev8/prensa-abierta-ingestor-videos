@@ -63,9 +63,68 @@ export interface ProcessedNews {
   wordpress_url?: string;
   video_status: 'none' | 'rendering' | 'ready' | 'failed';
   video_url?: string;
+  /** Ajustes granulares del "Editor de video" (tipografía, colores, posición,
+   *  logo, banner) elegidos para ESTA noticia. Ausente = layout por defecto de
+   *  la plantilla (ver VideoStyle abajo, mismos campos que en el Go Engine). */
+  video_style?: VideoStyle;
   created_at: string;
   published_at?: string;
   status: 'draft' | 'published' | 'scheduled';
+}
+
+/** Overrides granulares del titular/caja/rótulo/logo/banner sobre el layout por
+ *  defecto de una plantilla (ver layoutFor()/applyStyleOverrides() en el Go
+ *  Engine, pkg/video/engine.go). Todos los campos son opcionales: "" / 0 /
+ *  undefined = no tocar ese valor, se mantiene el default de la plantilla. */
+export interface VideoStyle {
+  headline_font?: 'league_spartan' | 'classic' | '';
+  headline_font_size?: number; // 24-72
+  headline_color?: string; // hex "#RRGGBB"
+  headline_x?: number;
+  headline_y?: number; // distancia desde el borde inferior del lienzo
+  headline_line_spacing?: number;
+  headline_align?: 'left' | 'center' | 'right';
+  headline_text?: string; // titular editado con saltos de línea manuales opcionales
+
+  box_color?: string; // hex
+  box_opacity?: number; // 0-1
+  box_height?: number;
+
+  header_text?: string;
+  header_color?: string; // hex
+
+  show_logo?: boolean;
+  logo_size?: number;
+  logo_x?: number;
+  logo_y?: number;
+
+  show_promo?: boolean;
+  promo_width?: number;
+
+  // Dinamismo & Transiciones
+  transition?: 'fade' | 'slide' | 'fadeblack' | 'cut';
+  shot_count?: number; // 2, 3 o 4 tomas
+
+  // Storyboard & Tomas individuales personalizadas por el usuario
+  custom_shots?: CustomShot[];
+}
+
+export interface CustomShot {
+  slot_index: number; // 0, 1, 2, 3
+  media_kind: 'image' | 'video';
+  url: string;
+  name?: string;
+  thumbnail?: string;
+}
+
+/** Un VideoStyle guardado con nombre para reutilizar en cualquier noticia
+ *  (opcional: el usuario decide explícitamente "Guardar como preset"/"Aplicar
+ *  preset" desde el Editor de video; nunca se auto-aplica). */
+export interface VideoStylePreset {
+  id: string;
+  name: string;
+  style: VideoStyle;
+  created_at: string;
 }
 
 export interface VideoJob {

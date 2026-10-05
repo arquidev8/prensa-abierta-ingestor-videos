@@ -3,6 +3,7 @@ package scraper
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -206,6 +207,9 @@ func (p *Poller) FetchAllNow() []*models.RawNews {
 }
 
 func (p *Poller) fetchFeed(src models.Source) []*models.RawNews {
+	if src.ID == "prensa-abierta" {
+		return p.fetchPrensaAbierta(src)
+	}
 	log.Printf("[Poller] Consultando feed: %s (%s)", src.Name, src.RSSURL)
 	feed, err := p.fetchAndParse(src)
 	if err != nil {
@@ -342,6 +346,134 @@ func (p *Poller) fetchFeed(src models.Source) []*models.RawNews {
 			msg += fmt.Sprintf(" — primer error: %v", firstImageErr)
 		}
 		log.Print(msg)
+	}
+
+	return newItems
+}
+
+type paAPIArticle struct {
+	ID                    int    `json:"id"`
+	Slug                  string `json:"slug"`
+	Title                 string `json:"title"`
+	Excerpt               string `json:"excerpt"`
+	Content               string `json:"content"`
+	PublishedAt           string `json:"publishedAt"`
+	FeaturedImageOriginal string `json:"featuredImageOriginal"`
+	FeaturedImageHero     string `json:"featuredImageHero"`
+	FeaturedImageCard     string `json:"featuredImageCard"`
+	Author                struct {
+		Name string `json:"name"`
+	} `json:"author"`
+	Category struct {
+		Name string `json:"name"`
+	} `json:"category"`
+}
+
+type paAPIResponse struct {
+	Data []paAPIArticle `json:"data"`
+}
+
+func (p *Poller) fetchPrensaAbierta(src models.Source) []*models.RawNews {
+	apiURL := "https://cms.prensaabierta.com/api/v1/articles"
+	log.Printf("[Poller] Consultando API oficial de Prensa Abierta: %s", apiURL)
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		log.Printf("[Poller ERROR] Prensa Abierta request error: %v", err)
+		return nil
+	}
+	req.Header.Set("User-Agent", feedUserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[Poller ERROR] Prensa Abierta fetch error: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[Poller ERROR] Prensa Abierta HTTP status %d", resp.StatusCode)
+		return nil
+	}
+
+	var parsed paAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		log.Printf("[Poller ERROR] Prensa Abierta JSON decode error: %v", err)
+		return nil
+	}
+
+	var newItems []*models.RawNews
+	for _, item := range parsed.Data {
+		articleURL := "https://prensaabierta.com/articles/" + item.Slug
+		hash := computeHash(item.Title, articleURL)
+		linkKey := models.LinkKey(src.ID, articleURL)
+
+		p.mu.Lock()
+		if p.seenHashes[hash] || (linkKey != "" && p.seenLinks[linkKey]) {
+			p.seenHashes[hash] = true
+			p.mu.Unlock()
+			continue
+		}
+		p.seenHashes[hash] = true
+		if linkKey != "" {
+			p.seenLinks[linkKey] = true
+		}
+		p.mu.Unlock()
+
+		imgURL := item.FeaturedImageOriginal
+		if imgURL == "" || !strings.HasPrefix(imgURL, "http") {
+			if item.FeaturedImageHero != "" {
+				if strings.HasPrefix(item.FeaturedImageHero, "http") {
+					imgURL = item.FeaturedImageHero
+				} else {
+					imgURL = "https://cms.prensaabierta.com" + item.FeaturedImageHero
+				}
+			} else if item.FeaturedImageCard != "" {
+				if strings.HasPrefix(item.FeaturedImageCard, "http") {
+					imgURL = item.FeaturedImageCard
+				} else {
+					imgURL = "https://cms.prensaabierta.com" + item.FeaturedImageCard
+				}
+			}
+		}
+
+		pubTime := time.Now()
+		if t, err := time.Parse(time.RFC3339, item.PublishedAt); err == nil {
+			pubTime = t
+		}
+
+		cat := src.Category
+		if item.Category.Name != "" {
+			cat = item.Category.Name
+		}
+
+		raw := &models.RawNews{
+			ID:          uuid.New().String(),
+			SourceID:    src.ID,
+			SourceName:  src.Name,
+			OriginalURL: articleURL,
+			Title:       strings.TrimSpace(item.Title),
+			Summary:     CleanSummary(item.Excerpt),
+			Content:     cleanHTMLText(item.Content),
+			Author:      item.Author.Name,
+			ImageURL:    imgURL,
+			PublishedAt: pubTime,
+			IngestedAt:  time.Now(),
+			Category:    cat,
+			Status:      "pending",
+			Hash:        hash,
+		}
+
+		newItems = append(newItems, raw)
+		if p.onNewNews != nil {
+			p.onNewNews(raw)
+		}
+	}
+
+	if len(newItems) > 0 {
+		log.Printf("[Poller] ✅ Se detectaron %d noticias nuevas de %s", len(newItems), src.Name)
 	}
 
 	return newItems

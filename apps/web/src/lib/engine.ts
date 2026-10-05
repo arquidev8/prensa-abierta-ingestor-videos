@@ -1,10 +1,14 @@
-import { RawNews, ProcessedNews, VideoJob, MediaItem } from './types';
+import { RawNews, ProcessedNews, VideoJob, MediaItem, VideoStyle } from './types';
 
 // Este módulo solo corre en el servidor: usa ENGINE_INTERNAL_URL (sin prefijo NEXT_PUBLIC_)
 // porque las variables NEXT_PUBLIC_* se incrustan en build-time en TODO el bundle,
 // incluido el código de servidor, y por eso no sirven para un valor distinto en runtime.
-const ENGINE_URL =
-  process.env.ENGINE_INTERNAL_URL || process.env.NEXT_PUBLIC_ENGINE_URL || 'http://localhost:8085';
+const rawEngineUrl = process.env.ENGINE_INTERNAL_URL;
+const rawConfigUrl =
+  rawEngineUrl && !rawEngineUrl.includes('//engine:')
+    ? rawEngineUrl
+    : process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:8085';
+const ENGINE_URL = rawConfigUrl.replace('localhost', '127.0.0.1');
 
 export async function fetchRawNews(): Promise<RawNews[]> {
   try {
@@ -71,6 +75,10 @@ export async function requestVideoRender(payload: {
   // Guion de la locución (ver lib/voiceScript.ts). Si viene y el Engine tiene
   // ELEVENLABS_API_KEY, lo convierte en voz y la mezcla al video; vacío = video mudo.
   voice_text?: string;
+  // Overrides granulares del Editor de video (tipografía, colores, posición,
+  // logo, banner) sobre el layout de `template`. Ausente = layout por defecto
+  // de la plantilla, sin cambios respecto al comportamiento anterior.
+  style?: VideoStyle;
 }, authToken: string): Promise<{ job_id: string; job: VideoJob }> {
   // El Engine exige sesión (Bearer) para encolar renders y aplica ahí el límite diario por rol.
   const res = await fetch(`${ENGINE_URL}/api/video/render`, {

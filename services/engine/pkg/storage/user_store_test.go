@@ -2,6 +2,8 @@ package storage_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -433,12 +435,62 @@ func TestUsageDayFollowsConfiguredTimezone(t *testing.T) {
 	}
 }
 
+func TestRefreshTokenPersistsAcrossStoreRestart(t *testing.T) {
+	store, pool := newTestStore(t)
+	ctx := context.Background()
+	user := mustCreate(t, store, "restart@prensa.pr", models.RoleEditor)
+	recoveredUserID := user.ID
+
+	first, err := store.CreateRefreshToken(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var storedTokenHash string
+	expectedTokenHashBytes := sha256.Sum256([]byte(first.Token))
+	expectedTokenHash := hex.EncodeToString(expectedTokenHashBytes[:])
+	if err := pool.QueryRow(ctx, `SELECT token_hash FROM refresh_tokens WHERE token_hash = $1`, expectedTokenHash).Scan(&storedTokenHash); err != nil {
+		t.Fatalf("leer refresh token persistido: %v", err)
+	}
+	if storedTokenHash == first.Token || len(storedTokenHash) != 64 {
+		t.Fatal("PostgreSQL debe almacenar únicamente el hash SHA-256, nunca el refresh token original")
+	}
+
+	restartedStore, err := storage.NewUserStore(ctx, pool, testTZ)
+	if err != nil {
+		t.Fatalf("crear store tras reinicio: %v", err)
+	}
+	user, err = store.GetUser(ctx, recoveredUserID)
+	if err != nil || user.ID != recoveredUserID {
+		t.Fatalf("GetUser(%q) = %v, err=%v", recoveredUserID, user, err)
+	}
+
+	rotated, got, err := restartedStore.RotateRefreshToken(ctx, first.Token)
+	if err != nil || got.ID != user.ID {
+		t.Fatalf("rotar después del reinicio: user=%v err=%v", got, err)
+	}
+	if rotated.Token == first.Token || !rotated.ExpiresAt.Equal(first.ExpiresAt) {
+		t.Fatal("la rotación debe conservar el vencimiento y emitir un token nuevo")
+	}
+
+	if _, err := store.CreateRefreshToken(ctx, user.ID); err != nil {
+		t.Fatalf("crear token revocable: %v", err)
+	}
+	revoked, err := store.CreateRefreshToken(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("crear token revocable: %v", err)
+	}
+	restartedStore.RevokeRefreshToken(ctx, revoked.Token)
+	if _, _, err := store.RotateRefreshToken(ctx, revoked.Token); !errors.Is(err, storage.ErrInvalidRefreshToken) {
+		t.Errorf("el token revocado debe rechazarse después del reinicio: %v", err)
+	}
+}
+
 func TestRefreshTokenRotation(t *testing.T) {
 	store, _ := newTestStore(t)
 	ctx := context.Background()
 	u := mustCreate(t, store, "rt@prensa.pr", models.RoleEditor)
 
-	first, err := store.CreateRefreshToken(u.ID)
+	first, err := store.CreateRefreshToken(ctx, u.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,13 +505,13 @@ func TestRefreshTokenRotation(t *testing.T) {
 		t.Errorf("el token viejo debe ser de un solo uso, err=%v", err)
 	}
 
-	store.RevokeRefreshToken(second.Token)
+	store.RevokeRefreshToken(ctx, second.Token)
 	if _, _, err := store.RotateRefreshToken(ctx, second.Token); !errors.Is(err, storage.ErrInvalidRefreshToken) {
 		t.Errorf("un token revocado no debe rotar, err=%v", err)
 	}
 
 	// El dueño borrado deja el refresh token inservible.
-	third, _ := store.CreateRefreshToken(u.ID)
+	third, _ := store.CreateRefreshToken(ctx, u.ID)
 	if _, err := store.DeleteUser(ctx, u.ID); err != nil {
 		t.Fatal(err)
 	}

@@ -3,9 +3,11 @@ package storage
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,7 +23,7 @@ import (
 // refreshTokenTTL es cuánto dura el refresh token (5 días) antes de exigir un login nuevo con
 // email/password. El access token (JWT, ver pkg/auth) dura mucho menos (15 min) y se renueva con el
 // refresh token sin pedir credenciales de nuevo — ver POST /api/auth/refresh. Los refresh tokens
-// viven solo en memoria (ver models.RefreshToken): reiniciar el proceso cierra las sesiones.
+// se almacenan como hashes en PostgreSQL y sobreviven reinicios del proceso.
 const refreshTokenTTL = 5 * 24 * time.Hour
 
 // Códigos de error de PostgreSQL que el store traduce a errores de entrada.
@@ -55,10 +57,6 @@ type UserStore struct {
 	// usageTZ es la zona horaria (nombre IANA) que define cuándo empieza el "día" del contador de
 	// videos; la evalúa PostgreSQL, que trae su propia base de zonas horarias.
 	usageTZ string
-
-	// refreshTokens vive solo en memoria (ver refreshTokenTTL).
-	refreshMu     sync.Mutex
-	refreshTokens map[string]*models.RefreshToken
 }
 
 // NewUserStore crea el store sobre un pool ya conectado y con las migraciones aplicadas. Falla si
@@ -69,9 +67,8 @@ func NewUserStore(ctx context.Context, pool *pgxpool.Pool, usageTZ string) (*Use
 		return nil, fmt.Errorf("zona horaria %q inválida: %w", usageTZ, err)
 	}
 	return &UserStore{
-		pool:          pool,
-		usageTZ:       usageTZ,
-		refreshTokens: make(map[string]*models.RefreshToken),
+		pool:    pool,
+		usageTZ: usageTZ,
 	}, nil
 }
 
@@ -208,58 +205,97 @@ func newRefreshTokenString() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// CreateRefreshToken emite un refresh token nuevo (refreshTokenTTL) para un usuario ya autenticado.
-// El access token (JWT) lo emite pkg/auth por separado: este store solo guarda el lado opaco.
-func (us *UserStore) CreateRefreshToken(userID string) (*models.RefreshToken, error) {
+// CreateRefreshToken emite un refresh token opaco nuevo, conservando únicamente su hash en PostgreSQL.
+func (us *UserStore) CreateRefreshToken(ctx context.Context, userID string) (*models.RefreshToken, error) {
+	parsedID, valid := parseID(userID)
+	if !valid {
+		return nil, ErrUserNotFound
+	}
 	tokenStr, err := newRefreshTokenString()
 	if err != nil {
 		return nil, err
 	}
 	rt := &models.RefreshToken{Token: tokenStr, UserID: userID, ExpiresAt: time.Now().Add(refreshTokenTTL)}
-	us.refreshMu.Lock()
-	us.refreshTokens[rt.Token] = rt
-	us.refreshMu.Unlock()
+	tokenHash := hashRefreshToken(tokenStr)
+	_, err = us.pool.Exec(ctx,
+		`INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
+		tokenHash, parsedID, rt.ExpiresAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("guardar refresh token: %w", err)
+	}
 	return rt, nil
 }
 
-// RotateRefreshToken cambia un refresh token válido por uno nuevo (de un solo uso: el viejo se
-// invalida en el mismo paso) y devuelve el usuario dueño, recargado de la base para ver su
-// Active/Role más recientes. La expiración ABSOLUTA se conserva: refrescar no extiende la sesión
-// más allá de refreshTokenTTL desde el login.
-func (us *UserStore) RotateRefreshToken(ctx context.Context, oldToken string) (*models.RefreshToken, *models.User, error) {
-	us.refreshMu.Lock()
-	old, ok := us.refreshTokens[oldToken]
-	if ok {
-		delete(us.refreshTokens, oldToken)
-	}
-	us.refreshMu.Unlock()
-	if !ok || time.Now().After(old.ExpiresAt) {
-		return nil, nil, ErrInvalidRefreshToken
-	}
+func hashRefreshToken(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(hash[:])
+}
 
-	user, err := us.GetUser(ctx, old.UserID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("usuario del refresh token: %w", err)
-	}
-	newTokenStr, err := newRefreshTokenString()
+// RotateRefreshToken cambia un refresh token válido por uno nuevo de un solo uso,
+// conservando su vencimiento original y rechazando usuarios inexistentes o inactivos.
+func (us *UserStore) RotateRefreshToken(ctx context.Context, oldToken string) (*models.RefreshToken, *models.User, error) {
+	newToken, err := newRefreshTokenString()
 	if err != nil {
 		return nil, nil, err
 	}
-	rotated := &models.RefreshToken{Token: newTokenStr, UserID: old.UserID, ExpiresAt: old.ExpiresAt}
-	us.refreshMu.Lock()
-	us.refreshTokens[rotated.Token] = rotated
-	us.refreshMu.Unlock()
+
+	// La transacción consume el refresh token una sola vez entre peticiones simultáneas.
+	tx, err := us.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("iniciar rotación del refresh token: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var userID int64
+	var expiresAt time.Time
+	err = tx.QueryRow(ctx, `
+		DELETE FROM refresh_tokens
+		WHERE token_hash = $1 AND expires_at > now()
+		RETURNING user_id, expires_at`, hashRefreshToken(oldToken),
+	).Scan(&userID, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, ErrInvalidRefreshToken
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("validar refresh token: %w", err)
+	}
+
+	user, err := scanUser(tx.QueryRow(ctx,
+		`SELECT `+userColumns+userFrom+` WHERE u.id = $1 AND u.active = true FOR UPDATE OF u`, userID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, ErrUserNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("usuario del refresh token: %w", err)
+	}
+
+	rotated := &models.RefreshToken{
+		Token:     newToken,
+		UserID:    strconv.FormatInt(userID, 10),
+		ExpiresAt: expiresAt,
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
+		hashRefreshToken(rotated.Token), userID, rotated.ExpiresAt,
+	); err != nil {
+		return nil, nil, fmt.Errorf("guardar refresh token rotado: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("confirmar rotación del refresh token: %w", err)
+	}
 	return rotated, user, nil
 }
 
 // RevokeRefreshToken invalida un refresh token (logout). Idempotente.
-func (us *UserStore) RevokeRefreshToken(token string) {
+func (us *UserStore) RevokeRefreshToken(ctx context.Context, token string) {
 	if token == "" {
 		return
 	}
-	us.refreshMu.Lock()
-	delete(us.refreshTokens, token)
-	us.refreshMu.Unlock()
+	if _, err := us.pool.Exec(ctx, `DELETE FROM refresh_tokens WHERE token_hash = $1`, hashRefreshToken(token)); err != nil {
+		log.Printf("[Auth] no se pudo revocar refresh token: %v", err)
+	}
 }
 
 // GetUser devuelve el usuario o ErrUserNotFound.

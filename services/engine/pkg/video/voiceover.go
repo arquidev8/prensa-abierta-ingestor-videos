@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/prensa-abierta/ingestor-engine/pkg/models"
 	"github.com/prensa-abierta/ingestor-engine/pkg/voice"
@@ -82,26 +83,71 @@ func (e *Engine) applyVoiceover(ctx context.Context, job *models.VideoJob, outpu
 	muxed := outputPath + ".voice.mp4"
 	defer os.Remove(muxed)
 
+	if err := e.mixVoiceover(ctx, outputPath, audioPath, filter, muxed); err != nil {
+		return fail(err)
+	}
+
+	// Validación de integridad: el archivo mezclado debe existir y no estar truncado
+	st, err := os.Stat(muxed)
+	if err != nil {
+		return fail(fmt.Errorf("archivo muxed no encontrado: %w", err))
+	}
+	if st.Size() < 200_000 {
+		return fail(fmt.Errorf("archivo muxed sospechosamente pequeño (%d bytes), posible pérdida de video", st.Size()))
+	}
+	if err := e.verifyMediaStreams(ctx, muxed); err != nil {
+		return fail(fmt.Errorf("verificación de pistas de video/audio falló: %w", err))
+	}
+
+	// Reemplazo con reintentos para Windows (por si algún handle del proceso FFmpeg tarda en cerrarse)
+	var renameErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		renameErr = os.Rename(muxed, outputPath)
+		if renameErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if renameErr != nil {
+		return fail(fmt.Errorf("reemplazar outputPath con locución: %w", renameErr))
+	}
+
+	log.Printf("[VideoEngine] 🔊 Locución agregada a %s (audio %.1fs, video %.0fs)", job.ID, audioDur, videoDur)
+	return "ok"
+}
+
+// verifyMediaStreams comprueba que el video contenga al menos una pista de video y una de audio.
+func (e *Engine) verifyMediaStreams(ctx context.Context, path string) error {
+	cmd := exec.CommandContext(ctx, e.ffmpegPath, "-hide_banner", "-i", path)
+	var buf bytes.Buffer
+	cmd.Stderr = &buf
+	_ = cmd.Run() // exit status 1 es esperado por falta de output; interesa el stderr
+	out := buf.String()
+	if !strings.Contains(out, "Video:") {
+		return fmt.Errorf("no se detectó pista de video")
+	}
+	if !strings.Contains(out, "Audio:") {
+		return fmt.Errorf("no se detectó pista de audio")
+	}
+	return nil
+}
+
+func (e *Engine) mixVoiceover(ctx context.Context, outputPath, audioPath, filter, muxed string) error {
 	args := []string{
 		"-y",
 		"-i", outputPath,
 		"-i", audioPath,
 		"-filter_complex", "[1:a]" + filter + "[a]",
-		"-map", "0:v", "-map", "[a]",
-		"-c:v", "copy", // el video ya está codificado: solo se agrega la pista de audio
+		"-map", "0:v:0", "-map", "[a]",
+		"-c:v", "copy",
 		"-c:a", "aac", "-b:a", "128k",
 		"-movflags", "+faststart",
 		muxed,
 	}
 	if out, err := exec.CommandContext(ctx, e.ffmpegPath, args...).CombinedOutput(); err != nil {
-		return fail(fmt.Errorf("mezclando audio: %v (salida: %s)", err, tailString(string(out), 400)))
+		return fmt.Errorf("mezclando audio: %v (salida: %s)", err, tailString(string(out), 400))
 	}
-	if err := os.Rename(muxed, outputPath); err != nil {
-		return fail(err)
-	}
-
-	log.Printf("[VideoEngine] 🔊 Locución agregada a %s (audio %.1fs, video %.0fs)", job.ID, audioDur, videoDur)
-	return "ok"
+	return nil
 }
 
 // voiceFilter arma la cadena de filtros de audio: si la locución no entra en `room`

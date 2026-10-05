@@ -17,6 +17,16 @@ func faviconURL(domain string) string {
 func GetDefaultPRSources() []models.Source {
 	return []models.Source{
 		{
+			ID:          "prensa-abierta",
+			Name:        "Prensa Abierta",
+			BaseURL:     "https://prensaabierta.com",
+			RSSURL:      "https://cms.prensaabierta.com/api/v1/articles",
+			Category:    "General",
+			Enabled:     true,
+			PollMinutes: 10,
+			LogoURL:     faviconURL("prensaabierta.com"),
+		},
+		{
 			ID:          "el-nuevo-dia",
 			Name:        "El Nuevo Día",
 			BaseURL:     "https://www.elnuevodia.com",

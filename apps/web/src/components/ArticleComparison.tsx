@@ -47,7 +47,21 @@ export function ArticleBody({
   content: string;
   className?: string;
 }) {
-  const paragraphs = useMemo(() => splitParagraphs(content), [content]);
+  const isHtml = useMemo(() => /<[a-z][\s\S]*>/i.test(content || ''), [content]);
+  const paragraphs = useMemo(() => (isHtml ? [] : splitParagraphs(content)), [content, isHtml]);
+
+  if (!content || content.trim() === '') {
+    return <p className="text-sm italic text-slate-400">No hay contenido disponible.</p>;
+  }
+
+  if (isHtml) {
+    return (
+      <div
+        className={`space-y-3 ${ARTICLE_PARA} [&_p]:mb-3 [&_strong]:font-black [&_strong]:text-slate-900 [&_a]:text-[#FF5500] [&_a]:underline [&_a]:font-bold [&_a]:cursor-pointer hover:[&_a]:text-[#E04B00] [&_a]:transition-colors ${className}`}
+        dangerouslySetInnerHTML={{ __html: content }}
+      />
+    );
+  }
 
   if (paragraphs.length === 0) {
     return <p className="text-sm italic text-slate-400">No hay contenido disponible.</p>;

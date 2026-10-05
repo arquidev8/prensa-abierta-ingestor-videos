@@ -4,6 +4,7 @@ import { searchPexelsVideos, searchPexelsPhotos } from '@/lib/pexels';
 import { requestVideoRender, checkVideoJob } from '@/lib/engine';
 import { sanitizeVideoDirection, VideoDirection } from '@/lib/videoDirection';
 import { buildVoiceScript } from '@/lib/voiceScript';
+import type { VideoStyle } from '@/lib/types';
 
 // Único pipeline de renderizado de video: el Go Engine (services/engine), con su
 // worker pool de tamaño acotado. Antes existía una segunda implementación de FFmpeg
@@ -55,6 +56,8 @@ export async function POST(req: NextRequest) {
       customClipUrl,
       videoDirection,
       body: articleBody,
+      style,
+      voiceText,
     } = body as {
       newsId?: string;
       headline?: string;
@@ -83,6 +86,11 @@ export async function POST(req: NextRequest) {
       videoDirection?: VideoDirection;
       // Cuerpo de la nota (HTML o texto): de acá sale el arranque que se locuta.
       body?: string;
+      // Overrides granulares del "Editor de video" (tipografía, colores, posición,
+      // logo, banner) sobre el layout de `template`. Ausente = sin cambios, el
+      // render sale idéntico al que había antes de esta feature.
+      style?: VideoStyle;
+      voiceText?: string;
     };
 
     if (!headline) {
@@ -100,7 +108,8 @@ export async function POST(req: NextRequest) {
     });
 
     const effectiveNewsId = newsId || `news_${Date.now()}`;
-    const origin = WEB_INTERNAL_URL || req.nextUrl.origin;
+    const effectiveWebUrl = WEB_INTERNAL_URL && !WEB_INTERNAL_URL.includes('//web:') ? WEB_INTERNAL_URL : '';
+    const origin = effectiveWebUrl || req.nextUrl.origin;
     // `streamUrl` ya es absoluta cuando el clip viene de Cloudinary (banco
     // migrado) — en ese caso el Go Engine la descarga directo del CDN, sin
     // pasar por `web`. Solo las rutas locales (`/api/media/...`) necesitan el
@@ -174,13 +183,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ── Paso 3: VIDEO de la misma carpeta ──────────────────────────────────
-    // El video importado por el usuario (Editor de video) tiene prioridad sobre
-    // todo lo demás.
-    let videoClipUrl: string | undefined = imageOnly
-      ? undefined
-      : customClipUrl
-        ? abs(customClipUrl)
-        : undefined;
+    const hasCustomClip = !imageOnly && !!customClipUrl;
     let videoSource = customClipUrl ? 'importado por el usuario' : '';
 
     // Cuándo las clip_queries de la IA (dirigidas al asunto real de la noticia)
@@ -193,28 +196,66 @@ export async function POST(req: NextRequest) {
     const bankClipIsGeneric = !!comp.video && !comp.videoIsTopicMatch;
     const preferAiClips =
       !imageOnly &&
-      !videoClipUrl &&
+      !hasCustomClip &&
       dir.source === 'ai' &&
       dir.clip_queries.length > 0 &&
       (comp.matchedFolderIsFallback || !comp.matchedTopic || bankClipIsGeneric);
 
-    // 1. Clip del banco (salvo que prefiramos las clip_queries de la IA).
-    let bankClipDeferred = false;
-    if (!imageOnly && !videoClipUrl && comp.video) {
-      if (preferAiClips) {
-        bankClipDeferred = true;
-      } else {
-        videoClipUrl = abs(comp.video.streamUrl);
-        videoSource = `banco ${comp.videoIsTopicMatch ? 'tema' : 'genérico'} (${comp.video.fileName})`;
+    const targetTotalShots = Math.max(2, Math.min(4, style?.shot_count || 3));
+    const targetVideoClips = imageOnly ? 0 : (leadImageUrl ? Math.max(1, targetTotalShots - 1) : targetTotalShots);
+    const clipUrls: string[] = [];
+    const pushClip = (url?: string) => {
+      if (!url) return false;
+      const absUrl = abs(url);
+      if (!clipUrls.includes(absUrl)) {
+        clipUrls.push(absUrl);
+        return true;
+      }
+      return false;
+    };
+
+    // Storyboard granular: si el usuario personalizó tomas individuales
+    if (style?.custom_shots && style.custom_shots.length > 0) {
+      const shot0 = style.custom_shots.find((s) => s.slot_index === 0);
+      if (shot0) {
+        if (shot0.media_kind === 'image') {
+          leadImageUrl = abs(shot0.url);
+          leadImageSource = `toma 1 personalizada (${shot0.name || 'foto'})`;
+        } else {
+          leadImageUrl = undefined;
+          pushClip(shot0.url);
+          videoSource = `toma 1 personalizada (${shot0.name || 'video'})`;
+        }
+      }
+      for (let sIdx = 1; sIdx < targetTotalShots; sIdx++) {
+        const shotN = style.custom_shots.find((s) => s.slot_index === sIdx);
+        if (shotN && shotN.url) {
+          pushClip(shotN.url);
+          if (!videoSource) videoSource = `toma ${sIdx + 1} personalizada (${shotN.name || 'video'})`;
+        }
       }
     }
 
-    // 2. Pexels: lista ordenada de queries. Cuando preferimos las de la IA van
-    // primero (más específicas de la noticia), con la query curada del tema como
-    // respaldo; en el flujo normal, primero la query del banco/tema y las de la
-    // IA de refuerzo. Se prueba cada una hasta que Pexels devuelva algo.
+    if (customClipUrl) {
+      pushClip(customClipUrl);
+      videoSource = 'importado por el usuario';
+    }
+
+    // 1. Clip del banco (salvo que prefiramos las clip_queries de la IA).
+    let bankClipDeferred = false;
+    if (!imageOnly && comp.video && clipUrls.length < targetVideoClips) {
+      if (preferAiClips) {
+        bankClipDeferred = true;
+      } else {
+        if (pushClip(comp.video.streamUrl)) {
+          if (!videoSource) videoSource = `banco ${comp.videoIsTopicMatch ? 'tema' : 'genérico'} (${comp.video.fileName})`;
+        }
+      }
+    }
+
+    // 2. Pexels: lista ordenada de queries para completar el número de tomas deseadas.
     let aiClipQueryUsed = false;
-    if (!imageOnly && !videoClipUrl) {
+    if (!imageOnly && clipUrls.length < targetVideoClips) {
       const clipQueries = (
         preferAiClips
           ? [...dir.clip_queries, comp.topicPexelsQuery, comp.videoPexelsQuery]
@@ -224,13 +265,15 @@ export async function POST(req: NextRequest) {
       ).filter((q, i, arr): q is string => !!q && arr.indexOf(q) === i);
 
       for (const q of clipQueries) {
+        if (clipUrls.length >= targetVideoClips) break;
         try {
           const pex = await searchPexelsVideos(q, category || 'general');
-          if (pex.length > 0) {
-            videoClipUrl = pex[0];
-            videoSource = `pexels (${q})`;
-            aiClipQueryUsed = dir.clip_queries.includes(q);
-            break;
+          for (const pUrl of pex) {
+            if (clipUrls.length >= targetVideoClips) break;
+            if (pushClip(pUrl)) {
+              if (!videoSource) videoSource = `pexels (${q})`;
+              aiClipQueryUsed = aiClipQueryUsed || dir.clip_queries.includes(q);
+            }
           }
         } catch (e) {
           console.warn('[render-video] Búsqueda de video en Pexels falló:', e);
@@ -238,19 +281,19 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 3. El clip del banco que se difirió en el paso 1, si Pexels no dio nada.
-    if (!imageOnly && !videoClipUrl && bankClipDeferred && comp.video) {
-      videoClipUrl = abs(comp.video.streamUrl);
-      videoSource = `banco ${comp.videoIsTopicMatch ? 'tema' : 'genérico'} (${comp.video.fileName})`;
+    // 3. El clip del banco que se difirió en el paso 1, si faltan tomas.
+    if (!imageOnly && bankClipDeferred && comp.video && clipUrls.length < targetVideoClips) {
+      if (pushClip(comp.video.streamUrl)) {
+        if (!videoSource) videoSource = `banco ${comp.videoIsTopicMatch ? 'tema' : 'genérico'} (${comp.video.fileName})`;
+      }
     }
 
-    // 4. Último recurso: el video genérico de la carpeta.
-    if (!imageOnly && !videoClipUrl && comp.videoFallback) {
-      videoClipUrl = abs(comp.videoFallback.streamUrl);
-      videoSource = `banco genérico (${comp.videoFallback.fileName})`;
+    // 4. Último recurso: el video genérico de la carpeta si faltan tomas.
+    if (!imageOnly && comp.videoFallback && clipUrls.length < targetVideoClips) {
+      if (pushClip(comp.videoFallback.streamUrl)) {
+        if (!videoSource) videoSource = `banco genérico (${comp.videoFallback.fileName})`;
+      }
     }
-
-    const clipUrls: string[] = videoClipUrl ? [videoClipUrl] : [];
 
     // `template` explícito del modal manda; si no vino, el de la dirección de video.
     const effectiveTemplate = template || dir.template;
@@ -273,20 +316,32 @@ export async function POST(req: NextRequest) {
         `plantilla=${effectiveTemplate} dur=${effectiveDuration}s base=${imageOnly ? 'imagen' : 'video'} ${aiClipsNote}`
     );
 
-    // ── Locución: categoría + titular + arranque de la nota, dentro del tiempo del video ──
-    const voice = buildVoiceScript({
-      category,
-      headline,
-      body: articleBody,
-      durationSec: effectiveDuration,
-    });
+    // ── Locución: texto personalizado por el usuario o generado automáticamente ──
+    const customCleanVoice = (voiceText || '').trim();
+    const voice = customCleanVoice
+      ? {
+          text: customCleanVoice,
+          words: customCleanVoice.split(/\s+/).filter(Boolean).length,
+          budgetWords: Math.floor(effectiveDuration * 2.3),
+          parts: {
+            category: false,
+            headlineTruncated: false,
+            bodySentences: 0,
+          },
+        }
+      : buildVoiceScript({
+          category,
+          headline,
+          body: articleBody,
+          durationSec: effectiveDuration,
+        });
+
     if (voice) {
       console.log(
-        `[render-video][voz] guion listo: ${voice.words}/${voice.budgetWords} palabras para ${effectiveDuration}s ` +
-          `(categoría=${voice.parts.category ? 'sí' : 'no'}, titular${voice.parts.headlineTruncated ? ' TRUNCADO' : ' completo'}, ` +
-          `oraciones de la nota=${voice.parts.bodySentences})`
+        `[render-video][voz] guion listo (${customCleanVoice ? 'personalizado por usuario' : 'automático'}): ` +
+          `${voice.words}/${voice.budgetWords} palabras para ${effectiveDuration}s ` +
+          `(texto="${voice.text}")`
       );
-      console.log(`[render-video][voz] texto: "${voice.text}"`);
     } else {
       console.log(
         `[render-video][voz] sin locución (duración ${effectiveDuration}s sin presupuesto de palabras o titular vacío)`
@@ -314,6 +369,7 @@ export async function POST(req: NextRequest) {
             ? 'app-promo'
             : 'standard',
       voice_text: voice?.text,
+      style,
     }, authToken);
 
     // El Engine renderiza de forma asíncrona (worker pool); hacemos polling acotado
@@ -341,7 +397,8 @@ export async function POST(req: NextRequest) {
           success: true,
           videoUrl: `/api/video/download?path=${encodeURIComponent(job.output_url)}&filename=${encodeURIComponent(
             safeFilename
-          )}`,
+          )}&inline=1`,
+          ...(job.voice_status ? { voiceStatus: job.voice_status } : {}),
         });
       }
 

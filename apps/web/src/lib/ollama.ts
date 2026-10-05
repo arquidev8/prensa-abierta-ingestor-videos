@@ -122,8 +122,13 @@ export async function rewriteNewsWithOllamaCloud(
     'https://ollama.com/v1'; // Compatible con Ollama Cloud / SiliconFlow / OpenAI
 
   const apiKey =
-    config?.apiKey ||
-    process.env.OLLAMA_CLOUD_API_KEY;
+    config?.apiKey?.trim() ||
+    process.env.OLLAMA_CLOUD_API_KEY?.trim();
+
+  if (!apiKey) {
+    console.info('[IA] OLLAMA_CLOUD_API_KEY no configurada. Usando Motor Autónomo Editorial sin llamar a la API remota.');
+    return generateAutonomousEditorial(rawTitle, rawContent, sourceName);
+  }
 
   let model = config?.model || process.env.OLLAMA_MODEL || 'glm-5.2';
 
@@ -227,6 +232,9 @@ Genera la redacción editorial para Prensa Abierta en formato JSON.`;
       return fetchIaWithRetry(endpoint, requestInit);
     });
 
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`La API IA rechazó las credenciales (${res.status}). Revisa OLLAMA_CLOUD_API_KEY y los permisos del proveedor configurado.`);
+    }
     if (!res.ok) {
       const errText = await res.text();
       throw new Error(`Error en API IA (${res.status}): ${errText}`);

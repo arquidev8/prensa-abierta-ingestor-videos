@@ -20,11 +20,12 @@ const persistDebounceInterval = 3 * time.Second
 
 // Store manages in-memory and persistent storage of news and media
 type Store struct {
-	mu            sync.RWMutex
-	rawNews       map[string]*models.RawNews
-	processedNews map[string]*models.ProcessedNews
-	mediaItems    map[string]*models.MediaItem
-	dataFilePath  string
+	mu                sync.RWMutex
+	rawNews           map[string]*models.RawNews
+	processedNews     map[string]*models.ProcessedNews
+	mediaItems        map[string]*models.MediaItem
+	videoStylePresets map[string]*models.VideoStylePreset
+	dataFilePath      string
 
 	dirty  bool          // true si hay cambios en memoria sin persistir
 	stopCh chan struct{} // señal de apagado para el loop de persistencia
@@ -35,11 +36,12 @@ type Store struct {
 func NewStore(dataDir string) *Store {
 	_ = os.MkdirAll(dataDir, 0755)
 	store := &Store{
-		rawNews:       make(map[string]*models.RawNews),
-		processedNews: make(map[string]*models.ProcessedNews),
-		mediaItems:    make(map[string]*models.MediaItem),
-		dataFilePath:  filepath.Join(dataDir, "db.json"),
-		stopCh:        make(chan struct{}),
+		rawNews:           make(map[string]*models.RawNews),
+		processedNews:     make(map[string]*models.ProcessedNews),
+		mediaItems:        make(map[string]*models.MediaItem),
+		videoStylePresets: make(map[string]*models.VideoStylePreset),
+		dataFilePath:      filepath.Join(dataDir, "db.json"),
+		stopCh:            make(chan struct{}),
 	}
 	store.loadFromFile()
 
@@ -264,6 +266,38 @@ func (s *Store) GetAllMediaItems(category, mediaType string) []*models.MediaItem
 	return list
 }
 
+// SaveVideoStylePreset crea o actualiza (si item.ID ya existía) un preset de
+// estilo de video reutilizable, guardado por nombre — nunca se auto-aplica a
+// ninguna noticia, el usuario lo elige explícitamente desde el Editor de video.
+func (s *Store) SaveVideoStylePreset(item *models.VideoStylePreset) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.videoStylePresets[item.ID] = item
+	s.dirty = true
+}
+
+func (s *Store) GetAllVideoStylePresets() []*models.VideoStylePreset {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]*models.VideoStylePreset, 0, len(s.videoStylePresets))
+	for _, item := range s.videoStylePresets {
+		list = append(list, item)
+	}
+	return list
+}
+
+// DeleteVideoStylePreset borra un preset por ID. Devuelve false si no existía.
+func (s *Store) DeleteVideoStylePreset(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.videoStylePresets[id]; !ok {
+		return false
+	}
+	delete(s.videoStylePresets, id)
+	s.dirty = true
+	return true
+}
+
 // persistLoop corre en su propia goroutine y hace el volcado a disco de
 // forma periódica (debounced) en vez de en cada mutación, y una vez más al
 // apagarse para no perder los últimos cambios pendientes.
@@ -296,9 +330,10 @@ func (s *Store) flushIfDirty() {
 	}
 	s.dirty = false
 	data := map[string]interface{}{
-		"raw_news":       s.rawNews,
-		"processed_news": s.processedNews,
-		"media_items":    s.mediaItems,
+		"raw_news":            s.rawNews,
+		"processed_news":      s.processedNews,
+		"media_items":         s.mediaItems,
+		"video_style_presets": s.videoStylePresets,
 	}
 	bytes, err := json.MarshalIndent(data, "", "  ")
 	s.mu.Unlock()
@@ -359,9 +394,10 @@ func (s *Store) loadFromFile() {
 		return
 	}
 	var data struct {
-		RawNews       map[string]*models.RawNews       `json:"raw_news"`
-		ProcessedNews map[string]*models.ProcessedNews `json:"processed_news"`
-		MediaItems    map[string]*models.MediaItem     `json:"media_items"`
+		RawNews           map[string]*models.RawNews           `json:"raw_news"`
+		ProcessedNews     map[string]*models.ProcessedNews     `json:"processed_news"`
+		MediaItems        map[string]*models.MediaItem         `json:"media_items"`
+		VideoStylePresets map[string]*models.VideoStylePreset  `json:"video_style_presets"`
 	}
 	if err := json.Unmarshal(bytes, &data); err == nil {
 		if data.RawNews != nil {
@@ -372,6 +408,9 @@ func (s *Store) loadFromFile() {
 		}
 		if data.MediaItems != nil {
 			s.mediaItems = data.MediaItems
+		}
+		if data.VideoStylePresets != nil {
+			s.videoStylePresets = data.VideoStylePresets
 		}
 	}
 }

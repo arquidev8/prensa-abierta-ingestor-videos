@@ -19,6 +19,8 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 	"github.com/prensa-abierta/ingestor-engine/pkg/auth"
 	"github.com/prensa-abierta/ingestor-engine/pkg/db"
 	"github.com/prensa-abierta/ingestor-engine/pkg/matcher"
@@ -29,20 +31,80 @@ import (
 	"github.com/prensa-abierta/ingestor-engine/pkg/voice"
 )
 
+func loadLocalEnvironment() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Printf("[Config] no se pudo determinar el directorio del proyecto: %v", err)
+		return ""
+	}
+
+	rootDir := cwd
+	foundGitRoot := false
+	for {
+		gitEntry := filepath.Join(rootDir, ".git")
+		if info, err := os.Stat(gitEntry); err == nil && info.IsDir() {
+			foundGitRoot = true
+		} else if data, err := os.ReadFile(gitEntry); err == nil && strings.HasPrefix(string(data), "gitdir:") {
+			foundGitRoot = true
+		}
+		if foundGitRoot {
+			break
+		}
+
+		parent := filepath.Dir(rootDir)
+		if parent == rootDir {
+			return ""
+		}
+		rootDir = parent
+	}
+
+	envPath := filepath.Join(rootDir, ".env")
+	if err := godotenv.Load(envPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("[Config] no se pudo cargar .env para desarrollo local: %v", err)
+	}
+	return rootDir
+}
+
+func isExistingDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
 func main() {
+	rootDir := loadLocalEnvironment()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8085"
 	}
 
 	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" {
-		dataDir = "./data"
+	if dataDir == "" || dataDir == "/app/data" || (!isExistingDir(dataDir) && rootDir != "") {
+		if rootDir != "" {
+			localData := filepath.Join(rootDir, "services", "engine", "data")
+			_ = os.MkdirAll(localData, 0755)
+			dataDir = localData
+		} else {
+			dataDir = "./data"
+		}
 	}
 
 	assetsDir := os.Getenv("ASSETS_DIR")
-	if assetsDir == "" {
-		assetsDir = "../../assets"
+	if assetsDir == "" || assetsDir == "/app/assets" || !isExistingDir(assetsDir) {
+		if rootDir != "" {
+			candidate := filepath.Join(rootDir, "assets")
+			if isExistingDir(candidate) {
+				assetsDir = candidate
+			}
+		}
+		if !isExistingDir(assetsDir) {
+			for _, rel := range []string{"../assets", "../../assets", "assets"} {
+				if isExistingDir(rel) {
+					assetsDir = rel
+					break
+				}
+			}
+		}
 	}
 
 	outputVideosDir := filepath.Join(dataDir, "videos")
@@ -212,9 +274,17 @@ func main() {
 		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS",
 	}))
 
-	// Serve generated MP4 videos and assets statically
-	app.Static("/videos", outputVideosDir)
-	app.Static("/assets", assetsDir)
+	// Serve generated MP4 videos and assets statically with ByteRange support for fast streaming/seeking
+	app.Static("/videos", outputVideosDir, fiber.Static{
+		ByteRange: true,
+		Browse:    false,
+		MaxAge:    3600,
+	})
+	app.Static("/assets", assetsDir, fiber.Static{
+		ByteRange: true,
+		Browse:    false,
+		MaxAge:    86400,
+	})
 
 	// Health Check
 	app.Get("/health", func(c *fiber.Ctx) error {
@@ -341,12 +411,12 @@ func main() {
 	// refreshTokenTTL = 5 días). Ambos viajan siempre juntos para que el
 	// cliente pueda seguir renovando el access token sin pedir credenciales de
 	// nuevo hasta que el refresh token expire.
-	issueTokenPair := func(user *models.User) (fiber.Map, error) {
+	issueTokenPair := func(ctx context.Context, user *models.User) (fiber.Map, error) {
 		accessToken, accessExp, err := jwtIssuer.IssueAccessToken(user.ID, user.Role)
 		if err != nil {
 			return nil, err
 		}
-		refresh, err := userStore.CreateRefreshToken(user.ID)
+		refresh, err := userStore.CreateRefreshToken(ctx, user.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -375,7 +445,7 @@ func main() {
 		if err != nil {
 			return internalError(c, err)
 		}
-		pair, err := issueTokenPair(user)
+		pair, err := issueTokenPair(c.UserContext(), user)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -428,7 +498,7 @@ func main() {
 			RefreshToken string `json:"refresh_token"`
 		}
 		_ = c.BodyParser(&body)
-		userStore.RevokeRefreshToken(body.RefreshToken)
+		userStore.RevokeRefreshToken(c.UserContext(), body.RefreshToken)
 		return c.SendStatus(204)
 	})
 
@@ -660,6 +730,49 @@ func main() {
 			return c.Status(404).JSON(fiber.Map{"error": "Trabajo no encontrado"})
 		}
 		return c.JSON(job)
+	})
+
+	// StyleDefaultsFor no necesita una instancia de Engine (no resuelve rutas de
+	// fuente en disco): el frontend solo necesita los valores numéricos/color de
+	// partida de cada plantilla para precargar los sliders del Editor de video.
+	app.Get("/api/video/style-defaults", func(c *fiber.Ctx) error {
+		template := c.Query("template", "standard")
+		return c.JSON(video.StyleDefaultsFor(template))
+	})
+
+	// Presets de estilo de video: guardados con nombre, aplicables opcionalmente
+	// a cualquier noticia desde el Editor de video. Nunca se auto-aplican.
+	app.Get("/api/video/style-presets", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"presets": store.GetAllVideoStylePresets()})
+	})
+
+	app.Post("/api/video/style-presets", func(c *fiber.Ctx) error {
+		var body struct {
+			Name  string            `json:"name"`
+			Style models.VideoStyle `json:"style"`
+		}
+		if err := c.BodyParser(&body); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+		}
+		if strings.TrimSpace(body.Name) == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "El preset necesita un nombre"})
+		}
+		preset := &models.VideoStylePreset{
+			ID:        uuid.New().String(),
+			Name:      strings.TrimSpace(body.Name),
+			Style:     body.Style,
+			CreatedAt: time.Now(),
+		}
+		store.SaveVideoStylePreset(preset)
+		return c.Status(201).JSON(preset)
+	})
+
+	app.Delete("/api/video/style-presets/:id", func(c *fiber.Ctx) error {
+		id := c.Params("id")
+		if !store.DeleteVideoStylePreset(id) {
+			return c.Status(404).JSON(fiber.Map{"error": "Preset no encontrado"})
+		}
+		return c.JSON(fiber.Map{"deleted": true})
 	})
 
 	// Media Bank Endpoints

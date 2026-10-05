@@ -132,12 +132,14 @@ async function performRefresh(): Promise<AuthSession | null> {
       body: JSON.stringify({ refresh_token: current.refresh_token }),
     });
     if (!res.ok) {
-      // Refresh token vencido, revocado (logout en otra pestaña) o usuario desactivado:
-      // no hay forma de recuperar la sesión sin loguearse de nuevo.
-      clearSession();
+      const latest = getSession();
+      if (latest?.refresh_token !== current.refresh_token) return latest;
+      if (res.status === 401 || res.status === 403) clearSession();
       return null;
     }
     const data = (await res.json()) as AuthSession;
+    const latest = getSession();
+    if (latest?.refresh_token !== current.refresh_token) return latest;
     saveSession(data);
     return data;
   } catch {
@@ -178,6 +180,47 @@ export async function ensureFreshSession(): Promise<AuthSession | null> {
 export async function authHeaderFresh(): Promise<Record<string, string>> {
   const session = await ensureFreshSession();
   return session ? { Authorization: `Bearer ${session.token}` } : {};
+}
+
+export async function fetchWithSession(
+  path: string,
+  init: Omit<RequestInit, 'body'> & { body?: string } = {}
+): Promise<Response> {
+  const unavailableSession = () => {
+    const canRetry = !!getSession();
+    return Response.json(
+      {
+        error: canRetry
+          ? 'No se pudo renovar la sesión. Intenta de nuevo en unos segundos.'
+          : 'Tu sesión venció o fue invalidada. Inicia sesión de nuevo para generar videos.',
+      },
+      { status: canRetry ? 503 : 401 }
+    );
+  };
+  const session = await ensureFreshSession();
+  if (!session) return unavailableSession();
+
+  const doFetch = (token: string) => {
+    const headers = new Headers(init.headers);
+    headers.set('Authorization', `Bearer ${token}`);
+    return fetch(path, { ...init, headers });
+  };
+
+  const response = await doFetch(session.token);
+  if (response.status !== 401) return response;
+
+  const current = getSession();
+  if (!current || current.user.id !== session.user.id) return response;
+  const refreshed = current.token !== session.token ? current : await refreshSession();
+  if (!refreshed) return unavailableSession();
+  if (refreshed.user.id !== session.user.id) return response;
+
+  const retried = await doFetch(refreshed.token);
+  if (retried.status === 401 && getSession()?.token === refreshed.token) {
+    clearSession();
+    return unavailableSession();
+  }
+  return retried;
 }
 
 // Reintento proactivo en segundo plano: cada 20s revisa si el access token está por vencer

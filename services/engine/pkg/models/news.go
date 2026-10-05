@@ -114,9 +114,14 @@ type ProcessedNews struct {
 	WordPressURL     string          `json:"wordpress_url,omitempty"`
 	VideoStatus      string          `json:"video_status"` // "none", "rendering", "ready", "failed"
 	VideoURL         string          `json:"video_url,omitempty"`
-	CreatedAt        time.Time       `json:"created_at"`
-	PublishedAt      time.Time       `json:"published_at,omitempty"`
-	Status           string          `json:"status"` // "draft", "published", "scheduled"
+	// VideoStyle guarda los ajustes granulares del Editor de video (tipografía,
+	// colores, posición, logo, banner) elegidos para ESTA noticia puntual, para
+	// que sobrevivan a cerrar y reabrir el modal. nil = sin overrides (layout por
+	// defecto de la plantilla, igual que antes de esta feature).
+	VideoStyle  *VideoStyle `json:"video_style,omitempty"`
+	CreatedAt   time.Time   `json:"created_at"`
+	PublishedAt time.Time   `json:"published_at,omitempty"`
+	Status      string      `json:"status"` // "draft", "published", "scheduled"
 }
 
 // VideoRenderRequest represents the payload to assemble a 10-15s vertical video
@@ -154,6 +159,75 @@ type VideoRenderRequest struct {
 	// configurada, el Engine lo convierte en voz (ElevenLabs) y la mezcla al .mp4.
 	// Vacío = video mudo. Ver pkg/voice y applyVoiceover() en pkg/video/voiceover.go.
 	VoiceText string `json:"voice_text"`
+	// Style son los overrides granulares del Editor de video (tipografía, colores,
+	// posición, logo, banner) sobre el layout de Template. nil = sin overrides,
+	// el render sale IDÉNTICO al que había antes de esta feature. Ver
+	// applyStyleOverrides() en pkg/video/engine.go.
+	Style *VideoStyle `json:"style,omitempty"`
+	// Transition ("fade", "slide", "fadeblack", "cut"): efecto de transición entre tomas
+	Transition string `json:"transition,omitempty"`
+}
+
+// VideoStyle son los ajustes granulares del titular/logo/banner que el usuario
+// puede editar en el Editor de video ANTES de descargar el .mp4, por encima del
+// layout por defecto de Template (ver layoutFor() en pkg/video/engine.go). Todos
+// los campos son opcionales ("" / 0 / nil = no tocar ese valor, se mantiene el
+// default de la plantilla) para que un VideoRenderRequest sin Style, o con un
+// Style parcial, rinda EXACTAMENTE igual que antes de esta feature.
+// Los valores numéricos se validan/clampan server-side en sanitizeStyle() antes
+// de construir cualquier filtro de FFmpeg (ver pkg/video/engine.go).
+type VideoStyle struct {
+	// Titular
+	HeadlineFont        string  `json:"headline_font,omitempty"`         // "league_spartan" | "classic"
+	HeadlineFontSize    int     `json:"headline_font_size,omitempty"`    // clamp 24-72
+	HeadlineColor       string  `json:"headline_color,omitempty"`        // hex "#RRGGBB"
+	HeadlineX           int     `json:"headline_x,omitempty"`
+	HeadlineY           int     `json:"headline_y,omitempty"` // distancia desde el borde inferior del lienzo
+	HeadlineLineSpacing int     `json:"headline_line_spacing,omitempty"`
+	HeadlineAlign       string  `json:"headline_align,omitempty"` // "left" | "center" | "right"
+	HeadlineText        string  `json:"headline_text,omitempty"`  // titular editado con saltos de línea manuales opcionales
+
+	// Caja/fondo detrás del titular
+	BoxColor   string  `json:"box_color,omitempty"` // hex
+	BoxOpacity float64 `json:"box_opacity,omitempty"` // clamp 0-1
+	BoxHeight  int     `json:"box_height,omitempty"`
+
+	// Rótulo "ULTIMA HORA • CATEGORÍA"
+	HeaderText  string `json:"header_text,omitempty"`
+	HeaderColor string `json:"header_color,omitempty"` // hex
+
+	// Logo Prensa Abierta
+	ShowLogo *bool `json:"show_logo,omitempty"`
+	LogoSize int   `json:"logo_size,omitempty"`
+	LogoX    int   `json:"logo_x,omitempty"`
+	LogoY    int   `json:"logo_y,omitempty"`
+
+	// Banner "Descarga la App GRATIS"
+	ShowPromo  *bool `json:"show_promo,omitempty"`
+	PromoWidth int   `json:"promo_width,omitempty"`
+
+	// Dinamismo & Transiciones
+	Transition  string       `json:"transition,omitempty"`   // "fade", "slide", "fadeblack", "cut"
+	ShotCount   int          `json:"shot_count,omitempty"`   // 2, 3, 4
+	CustomShots []CustomShot `json:"custom_shots,omitempty"` // Tomas individuales personalizadas
+}
+
+// CustomShot representa un clip o imagen configurado para una toma concreta del Reel
+type CustomShot struct {
+	SlotIndex int    `json:"slot_index"` // 0, 1, 2, 3
+	MediaKind string `json:"media_kind"` // "image" | "video"
+	URL       string `json:"url"`
+	Name      string `json:"name,omitempty"`
+}
+
+// VideoStylePreset es un VideoStyle guardado con nombre para reutilizar en
+// cualquier noticia (opcional: el usuario decide explícitamente "Guardar como
+// preset"/"Aplicar preset" desde el Editor de video; nunca se auto-aplica).
+type VideoStylePreset struct {
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	Style     VideoStyle `json:"style"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // VideoJob represents an asynchronous video rendering task

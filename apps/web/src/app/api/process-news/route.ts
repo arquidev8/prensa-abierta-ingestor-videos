@@ -7,10 +7,11 @@ import { RawNews, ProcessedNews } from '@/lib/types';
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { rawNews, autoPublishWP, ollamaModel } = body as {
+    const { rawNews, autoPublishWP, ollamaModel, includeSourceCitation } = body as {
       rawNews: RawNews;
       autoPublishWP?: boolean;
       ollamaModel?: string;
+      includeSourceCitation?: boolean;
     };
 
     if (!rawNews || !rawNews.title) {
@@ -45,6 +46,22 @@ export async function POST(req: NextRequest) {
       featuredImageUrl = mediaList[0].url;
     }
 
+    // 2.5. Atribución opcional de la fuente original
+    const shouldCite = includeSourceCitation !== undefined
+      ? Boolean(includeSourceCitation)
+      : (rawNews.source_id !== 'prensa-abierta');
+
+    let finalContentHtml = editorial.content_html;
+    if (shouldCite && rawNews.source_name && rawNews.source_id !== 'prensa-abierta') {
+      const linkHtml = rawNews.original_url
+        ? ` (<a href="${rawNews.original_url}" target="_blank" rel="noopener noreferrer" style="color: #FF5500; text-decoration: underline;">ver fuente original</a>)`
+        : '';
+      const citationHtml = `<p class="source-citation" style="margin-top: 1.5rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0; font-size: 0.85rem; color: #64748b; font-style: italic;">Información recopilada y adaptada a partir del reporte original publicado por <strong>${rawNews.source_name}</strong>${linkHtml}.</p>`;
+      if (!finalContentHtml.includes('source-citation')) {
+        finalContentHtml += citationHtml;
+      }
+    }
+
     // 3. Inyección en WordPress (Modo Sandbox seguro)
     let wpPostId: number | undefined = undefined;
     let wpUrl: string | undefined = undefined;
@@ -53,7 +70,7 @@ export async function POST(req: NextRequest) {
       console.log(`[Pipeline] 3. Inyectando en WordPress...`);
       const wpResult = await publishToWordPress({
         title: editorial.title,
-        content: editorial.content_html,
+        content: finalContentHtml,
         excerpt: editorial.subtitle,
         status: 'publish',
       });
@@ -78,7 +95,7 @@ export async function POST(req: NextRequest) {
       raw_news_id: rawNews.id,
       title: editorial.title,
       subtitle: editorial.subtitle,
-      content_html: editorial.content_html,
+      content_html: finalContentHtml,
       category: editorial.category,
       tags: editorial.tags,
       video_search_tags: editorial.video_search_tags,

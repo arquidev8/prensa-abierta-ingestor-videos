@@ -23,7 +23,7 @@ import VideoPlayerPreview from '@/components/VideoPlayerPreview';
 import StructuredArticleReader from '@/components/StructuredArticleReader';
 import EngineOfflineBanner from '@/components/EngineOfflineBanner';
 import { fetchFromEngine } from '@/lib/engineClient';
-import { authHeaderFresh } from '@/lib/authClient';
+import { fetchWithSession } from '@/lib/authClient';
 import { notifyVideoUsageChanged } from '@/lib/videoUsage';
 import { inferNewsCategory } from '@/lib/newsCategorizer';
 
@@ -98,11 +98,9 @@ export default function AutopilotHubPage() {
       // (MAX_WAIT_MS = 190s) al pollear el job del Go Engine, pero este límite adicional
       // garantiza que el botón nunca quede "generando" para siempre ante un fallo de
       // red, un proxy colgado, etc.
-      const res = await fetch('/api/render-video', {
+      const res = await fetchWithSession('/api/render-video', {
         method: 'POST',
-        // Renueva el access token antes si está por vencer (dura 15 min): esta ruta no
-        // tiene el reintento automático que sí tiene engineRequest().
-        headers: { 'Content-Type': 'application/json', ...(await authHeaderFresh()) },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           newsId: item.id || `news_${Date.now()}`,
           headline: item.title,

@@ -2,9 +2,16 @@ package video
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/jpeg"
+	"image/png"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -184,7 +191,7 @@ func (e *Engine) RenderVideo(ctx context.Context, jobID string) (*models.VideoJo
 	job.Progress = 10
 	e.mu.Unlock()
 
-	outputFilename := fmt.Sprintf("video_%s_%d.mp4", job.Request.NewsID, time.Now().Unix())
+	outputFilename := fmt.Sprintf("video_%s_%s.mp4", job.Request.NewsID, job.ID)
 	outputPath := filepath.Join(e.outputDir, outputFilename)
 
 	log.Printf("[VideoEngine] Iniciando renderizado de video para '%s' (Duración: %ds, Salida: %s)",
@@ -246,32 +253,118 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 		return e.renderImageZoomVideo(ctx, job, outputPath, leadImage, total)
 	}
 
+	// Cache de base b-roll pre-renderizada: permite cambiar texto, tipografía y estilos
+	// en ~2s sin volver a descargar, recortar ni transcodificar los clips crudos.
+	baseCacheDir := filepath.Join(e.outputDir, "base_cache")
+	_ = os.MkdirAll(baseCacheDir, 0755)
+	lo := layoutFor(req.Template)
+	lo.boxColor, lo.boxOpacity = "black", 0.85
+	lo.headFontSize, lo.headColor, lo.headX = headlineFontSize, "white", 74
+	lo.showLogo, lo.logoSize, lo.logoX = true, 240, "W-w-60"
+	lo.headFontFile = e.fontFileFor("classic")
+	lo = e.applyStyleOverrides(lo, req.Style)
+
+	headlineText := resolveHeadlineText(req)
+	// Calcular dinámicamente el ancho de línea para que NUNCA se corte por la derecha
+	maxChars := computeMaxCharsPerLine(lo.headFontSize, lo.headX, lo.headFontFile)
+	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(headlineText), maxChars, headlineMaxLines)
+	// Ajustar reactivamente titular, banner y caja de fondo para que NUNCA se corte abajo
+	lo = adjustLayoutForContent(lo, cleanHeadline, lo.headFontSize)
+	if cardPath, err := e.generateRoundedCardPNG(1000, lo.cardH, 32, lo.boxColor, lo.boxOpacity); err == nil {
+		lo.cardImagePath = cardPath
+	}
+
+	baseHashKey := fmt.Sprintf("%s|%s|%.2f|%d|%t|%s|%s|%d",
+		strings.Join(req.ClipURLs, ";"), leadImage, req.LeadImageSec, total, req.NoCategoryFallback, req.Category, lo.transition, lo.shotCount)
+	baseHash := fmt.Sprintf("%x", sha1.Sum([]byte(baseHashKey)))
+	baseVideoPath := filepath.Join(baseCacheDir, fmt.Sprintf("base_%s.mp4", baseHash))
+
+	videoFilter := strings.Join([]string{
+		// Punto pulsante + rótulo "ULTIMA HORA • CATEGORÍA"
+		e.categoryHeaderFilters(req.Category, lo),
+		// Headline text con alineación y salto de línea dinámico
+		e.buildHeadlineDrawtext(cleanHeadline, lo),
+	}, ",")
+
+	encodeArgs := []string{"-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "0", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
+
+	if stat, err := os.Stat(baseVideoPath); err == nil && stat.Size() > 0 {
+		log.Printf("[VideoEngine ⚡] Reutilizando base b-roll pre-renderizada en caché (%s)", baseVideoPath)
+		inputArgs := []string{"-i", baseVideoPath}
+		args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, total, lo)
+		cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("error al ejecutar FFmpeg: %v (salida: %s)", err, string(output))
+		}
+		return nil
+	}
+
 	// Prepare temporary list for concatenation
 	tempDir := filepath.Join(e.outputDir, "temp_"+job.ID)
 	_ = os.MkdirAll(tempDir, 0755)
 	defer os.RemoveAll(tempDir)
 
 	var preparedClips []string
+	var clipDurations []float64
+
+	targetShots := lo.shotCount
+	if targetShots <= 0 {
+		targetShots = 3 // 3 tomas por defecto para dinamismo moderno
+	}
+	transName := lo.transition
+	if transName == "" {
+		transName = "fade"
+	}
+	transDur := 0.45
+	if transName == "cut" || transName == "none" {
+		transDur = 0.0
+	}
+
+	// Cantidad de clips de video a utilizar
+	maxVideoClips := targetShots
+	if leadImage != "" && maxVideoClips > 1 {
+		maxVideoClips--
+	}
+	nClips := len(req.ClipURLs)
+	if nClips > maxVideoClips {
+		nClips = maxVideoClips
+	}
+
+	totalClips := nClips
+	if leadImage != "" {
+		totalClips++
+	}
+	if totalClips <= 0 {
+		totalClips = 1
+	}
+
+	// Solapamiento total absorbido por las transiciones xfade
+	totalRawDuration := float64(total) + float64(totalClips-1)*transDur
 
 	// Segmento de imagen temática como PRIMER clip (imagen fija con zoom corto).
 	imageSec := 0.0
 	if leadImage != "" {
 		imageSec = req.LeadImageSec
 		if imageSec <= 0 {
-			imageSec = float64(total) * 0.4
+			imageSec = 3.5
+			if totalClips >= 4 {
+				imageSec = 2.8
+			}
 		}
 		if imageSec > 5 {
 			imageSec = 5
 		}
-		if imageSec > float64(total)-3 {
-			imageSec = float64(total) - 3
+		if imageSec > totalRawDuration-2 {
+			imageSec = totalRawDuration - 2
 		}
-		if imageSec < 2 {
+		if imageSec < 1.5 {
 			imageSec = 0 // muy poco tiempo: se omite la imagen
 		}
 		if imageSec > 0 {
 			if seg, err := e.prepareImageSegment(ctx, tempDir, leadImage, imageSec); err == nil {
 				preparedClips = append(preparedClips, seg)
+				clipDurations = append(clipDurations, imageSec)
 			} else {
 				log.Printf("[VideoEngine] Warning: no se pudo preparar la imagen líder %s: %v", leadImage, err)
 				imageSec = 0
@@ -280,46 +373,33 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 	}
 
 	// Clips de video para el tiempo restante.
-	nClips := len(req.ClipURLs)
-	if nClips > 3 {
-		nClips = 3 // Máx. 3 clips para 10-15s
-	}
-	remaining := float64(total) - imageSec
+	remaining := totalRawDuration - imageSec
 	if remaining < 1 {
-		remaining = float64(total)
+		remaining = totalRawDuration
 	}
-	clipDuration := remaining / float64(nClips)
+	clipDuration := remaining
+	if nClips > 0 {
+		clipDuration = remaining / float64(nClips)
+	}
 
 	videoClipsAdded := 0
 	for i := 0; i < nClips; i++ {
 		clipURL := req.ClipURLs[i]
-		// El slot de "video de composición" también acepta una imagen (Editor de
-		// video, apps/web): se detecta por extensión y se renderiza con el MISMO
-		// zoom lento que la imagen de portada (`coverImageFilter`), en vez de
-		// tratarla como un clip de video — una imagen suelta por `-i` sin `-loop 1`
-		// solo produce 1 frame, así que necesita su propio camino.
 		isImg := isImageClipURL(clipURL)
 
-		// Los clips remotos (Pexels, CDN, subidas del Editor de video) se descargan
-		// a un archivo local ANTES de pasarlos a FFmpeg. Darle una URL a `-i` hace
-		// que FFmpeg la baje por su cuenta SIN timeout: un clip HD grande de stock o
-		// un CDN lento agotaba el timeout de render y el proceso moría con
-		// `signal: killed`. Con la descarga acotada acá, un clip lento se saltea
-		// (continue) en vez de tumbar todo el render.
 		inputPath := clipURL
 		if strings.HasPrefix(clipURL, "http://") || strings.HasPrefix(clipURL, "https://") {
-			pattern := "src_clip_*.mp4"
+			ext := ".mp4"
 			timeout := 60 * time.Second
 			if isImg {
-				pattern = "src_clip_img_*.jpg"
+				ext = ".jpg"
 				timeout = 20 * time.Second
 			}
-			local, derr := e.downloadToTempFile(ctx, clipURL, pattern, timeout)
+			local, derr := e.getOrDownloadMedia(ctx, clipURL, ext, timeout)
 			if derr != nil {
 				log.Printf("[VideoEngine] Warning: no se pudo descargar el clip %s: %v", clipURL, derr)
 				continue
 			}
-			defer os.Remove(local)
 			inputPath = local
 		}
 
@@ -336,6 +416,7 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 				"-map", "[cf_out]",
 				"-c:v", "libx264",
 				"-preset", "ultrafast",
+				"-threads", "0",
 				"-pix_fmt", "yuv420p",
 				"-an",
 				trimmedPath,
@@ -350,6 +431,7 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 				"-vf", filter,
 				"-c:v", "libx264",
 				"-preset", "ultrafast",
+				"-threads", "0",
 				"-pix_fmt", "yuv420p",
 				"-an",
 				trimmedPath,
@@ -363,12 +445,11 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 			continue
 		}
 		preparedClips = append(preparedClips, trimmedPath)
+		clipDurations = append(clipDurations, clipDuration)
 		videoClipsAdded++
 	}
 
-	// Ningún clip de video se pudo preparar (Pexels caído, URLs muertas, etc.): no
-	// dejar un video de solo ~4s (el segmento de imagen); animar la imagen la
-	// duración completa.
+	// Ningún clip de video se pudo preparar (Pexels caído, URLs muertas, etc.): animar la imagen
 	if videoClipsAdded == 0 {
 		if leadImage != "" {
 			return e.renderImageZoomVideo(ctx, job, outputPath, leadImage, total)
@@ -379,30 +460,14 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 		return e.renderFallbackColorVideo(ctx, job, outputPath)
 	}
 
-	// Concat file
-	concatListFile := filepath.Join(tempDir, "concat.txt")
-	var sb strings.Builder
-	for _, p := range preparedClips {
-		sb.WriteString(fmt.Sprintf("file '%s'\n", filepath.ToSlash(p)))
+	// Ensamblar base de video con tomas y transiciones (xfade o concat)
+	tempBasePath := filepath.Join(tempDir, fmt.Sprintf("base_%s.mp4", job.ID))
+	if err := e.assembleBaseVideo(ctx, tempDir, preparedClips, clipDurations, transName, tempBasePath); err != nil {
+		return fmt.Errorf("ensamblar base de video con tomas y transiciones: %w", err)
 	}
-	_ = os.WriteFile(concatListFile, []byte(sb.String()), 0644)
 
-	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(req.Headline), headlineMaxCharsPerLine, headlineMaxLines)
-	lo := layoutFor(req.Template)
-	lo.promoY = computePromoY(lo, cleanHeadline, headlineFontSize)
-
-	videoFilter := strings.Join([]string{
-		// Dark box at bottom for legibility
-		fmt.Sprintf("drawbox=y=%s:color=black@0.85:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
-		// Punto pulsante + rótulo "ULTIMA HORA • CATEGORÍA"
-		categoryHeaderFilters(req.Category, lo),
-		// Headline text, con salto de línea real (line_spacing) en vez de recortarse
-		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=%s:line_spacing=%d:fix_bounds=true", cleanHeadline, lo.headY, lo.headLineSpacing),
-	}, ",")
-
-	inputArgs := []string{"-f", "concat", "-safe", "0", "-i", concatListFile}
-	encodeArgs := []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
-
+	_ = os.Rename(tempBasePath, baseVideoPath)
+	inputArgs := []string{"-i", baseVideoPath}
 	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, total, lo)
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
@@ -410,6 +475,123 @@ func (e *Engine) executeFFmpegRender(ctx context.Context, job *models.VideoJob, 
 		return fmt.Errorf("error al ejecutar FFmpeg: %v (salida: %s)", err, string(output))
 	}
 
+	return nil
+}
+
+// assembleBaseVideo concatena los clips preparados aplicando transiciones fluidas
+// (xfade: fade, slide, fadeblack) o corte limpio (concat demuxer), garantizando
+// dinamismo visual en el Reel sin cortes bruscos.
+func (e *Engine) assembleBaseVideo(ctx context.Context, tempDir string, clips []string, durations []float64, transition string, outPath string) error {
+	if len(clips) == 0 {
+		return fmt.Errorf("no hay clips para concatenar")
+	}
+	if len(clips) == 1 || transition == "cut" || transition == "none" {
+		concatListFile := filepath.Join(tempDir, "concat.txt")
+		if err := writeConcatFile(concatListFile, tempDir, clips); err != nil {
+			return err
+		}
+		baseArgs := []string{
+			"-y",
+			"-f", "concat", "-safe", "0", "-i", concatListFile,
+			"-c:v", "libx264", "-preset", "ultrafast", "-threads", "0",
+			"-pix_fmt", "yuv420p", "-an",
+			outPath,
+		}
+		cmd := exec.CommandContext(ctx, e.ffmpegPath, baseArgs...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("concat error: %w (%s)", err, string(out))
+		}
+		return nil
+	}
+
+	transName := "fade"
+	switch transition {
+	case "slide":
+		transName = "slideleft"
+	case "fadeblack":
+		transName = "fadeblack"
+	case "fade":
+		transName = "fade"
+	}
+
+	const transDur = 0.45
+	var filterParts []string
+	currentStream := "[0:v]"
+	accumulatedDuration := durations[0]
+
+	for i := 1; i < len(clips); i++ {
+		offset := accumulatedDuration - transDur
+		if offset < 0 {
+			offset = 0
+		}
+		nextStream := fmt.Sprintf("[%d:v]", i)
+		outStream := fmt.Sprintf("[v%d]", i)
+		if i == len(clips)-1 {
+			outStream = "[vfinal]"
+		}
+		filterParts = append(filterParts, fmt.Sprintf("%s%sxfade=transition=%s:duration=%.2f:offset=%.2f%s",
+			currentStream, nextStream, transName, transDur, offset, outStream))
+		currentStream = outStream
+		dur := 4.0
+		if i < len(durations) {
+			dur = durations[i]
+		}
+		accumulatedDuration = accumulatedDuration + dur - transDur
+	}
+
+	filterGraph := strings.Join(filterParts, ";")
+	var args []string
+	args = append(args, "-y")
+	for _, c := range clips {
+		args = append(args, "-i", c)
+	}
+	args = append(args,
+		"-filter_complex", filterGraph,
+		"-map", "[vfinal]",
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-threads", "0",
+		"-pix_fmt", "yuv420p",
+		"-an",
+		outPath,
+	)
+
+	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[VideoEngine] Warning: xfade falló (%v: %s), recurriendo a corte limpio", err, string(out))
+		concatListFile := filepath.Join(tempDir, "concat.txt")
+		if werr := writeConcatFile(concatListFile, tempDir, clips); werr != nil {
+			return werr
+		}
+		fbArgs := []string{
+			"-y",
+			"-f", "concat", "-safe", "0", "-i", concatListFile,
+			"-c:v", "libx264", "-preset", "ultrafast", "-threads", "0",
+			"-pix_fmt", "yuv420p", "-an",
+			outPath,
+		}
+		cmdFallback := exec.CommandContext(ctx, e.ffmpegPath, fbArgs...)
+		if fbout, fberr := cmdFallback.CombinedOutput(); fberr != nil {
+			return fmt.Errorf("fallback concat error: %w (%s)", fberr, string(fbout))
+		}
+	}
+	return nil
+}
+
+func writeConcatFile(concatListFile, tempDir string, clips []string) error {
+	var contents strings.Builder
+	for _, clip := range clips {
+		relativePath, err := filepath.Rel(tempDir, clip)
+		if err != nil {
+			return fmt.Errorf("resolver la ruta del clip %q: %w", clip, err)
+		}
+		contents.WriteString(fmt.Sprintf("file '%s'\n", filepath.ToSlash(relativePath)))
+	}
+	if err := os.WriteFile(concatListFile, []byte(contents.String()), 0644); err != nil {
+		return fmt.Errorf("escribir %q: %w", concatListFile, err)
+	}
 	return nil
 }
 
@@ -458,11 +640,10 @@ func coverImageFilter(dur int) string {
 // para poder concatenarlo como PRIMER segmento de la composición. Devuelve la ruta
 // del archivo generado en tempDir.
 func (e *Engine) prepareImageSegment(ctx context.Context, tempDir, imageURL string, sec float64) (string, error) {
-	localImg, err := e.downloadToTempFile(ctx, imageURL, "src_image_*.jpg", 20*time.Second)
+	localImg, err := e.getOrDownloadMedia(ctx, imageURL, ".jpg", 20*time.Second)
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(localImg)
 
 	out := filepath.Join(tempDir, "clip_lead_image.mp4")
 	secInt := int(sec + 0.999)
@@ -474,6 +655,7 @@ func (e *Engine) prepareImageSegment(ctx context.Context, tempDir, imageURL stri
 		"-filter_complex", "[0:v]" + coverImageFilter(secInt) + ",fps=30,format=yuv420p[cf_out]",
 		"-map", "[cf_out]",
 		"-c:v", "libx264", "-preset", "ultrafast",
+		"-threads", "0",
 		"-pix_fmt", "yuv420p",
 		"-an",
 		out,
@@ -488,10 +670,6 @@ func (e *Engine) prepareImageSegment(ctx context.Context, tempDir, imageURL stri
 // renderImageZoomVideo genera el reel completo a partir de UNA imagen (URL) con
 // zoom corto durante toda la duración + overlays (caja, rótulo, titular, logo).
 // Se usa cuando no hay ningún clip de video (banco propio, Pexels ni destacada).
-//
-// La imagen se descarga a un archivo LOCAL antes de `-loop 1 -i`: loopear una
-// imagen servida por HTTP hace que FFmpeg no termine solo (sigue "vivo" tras
-// escribir todos los frames y el worker lo mata al llegar al timeout).
 func (e *Engine) renderImageZoomVideo(ctx context.Context, job *models.VideoJob, outputPath, imageURL string, durationSec int) error {
 	req := job.Request
 	duration := durationSec
@@ -499,26 +677,77 @@ func (e *Engine) renderImageZoomVideo(ctx context.Context, job *models.VideoJob,
 		duration = 12
 	}
 
-	localImagePath, err := e.downloadToTempFile(ctx, imageURL, "src_image_*.jpg", 20*time.Second)
+	localImagePath, err := e.getOrDownloadMedia(ctx, imageURL, ".jpg", 20*time.Second)
 	if err != nil {
 		log.Printf("[VideoEngine] Warning: no se pudo descargar la imagen %s: %v", imageURL, err)
 		return e.renderFallbackColorVideo(ctx, job, outputPath)
 	}
-	defer os.Remove(localImagePath)
 
-	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(req.Headline), headlineMaxCharsPerLine, headlineMaxLines)
 	lo := layoutFor(req.Template)
-	lo.promoY = computePromoY(lo, cleanHeadline, headlineFontSize)
+	lo.boxColor, lo.boxOpacity = "black", 0.85
+	lo.headFontSize, lo.headColor, lo.headX = headlineFontSize, "white", 74
+	lo.showLogo, lo.logoSize, lo.logoX = true, 240, "W-w-60"
+	lo.headFontFile = e.fontFileFor("classic")
+	lo = e.applyStyleOverrides(lo, req.Style)
 
-	videoFilter := strings.Join([]string{
-		coverImageFilter(duration),
-		fmt.Sprintf("drawbox=y=%s:color=black@0.85:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
-		categoryHeaderFilters(req.Category, lo),
-		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=46:x=70:y=%s:line_spacing=%d:fix_bounds=true", cleanHeadline, lo.headY, lo.headLineSpacing),
-	}, ",")
+	headlineText := resolveHeadlineText(req)
+	// Calcular dinámicamente el ancho de línea para que NUNCA se corte por la derecha
+	maxChars := computeMaxCharsPerLine(lo.headFontSize, lo.headX, lo.headFontFile)
+	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(headlineText), maxChars, headlineMaxLines)
+	lo = adjustLayoutForContent(lo, cleanHeadline, lo.headFontSize)
+	if cardPath, err := e.generateRoundedCardPNG(1000, lo.cardH, 32, lo.boxColor, lo.boxOpacity); err == nil {
+		lo.cardImagePath = cardPath
+	}
 
-	inputArgs := []string{"-loop", "1", "-t", fmt.Sprintf("%d", duration), "-i", localImagePath}
-	encodeArgs := []string{"-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
+	baseImgKey := fmt.Sprintf("%s|%d", imageURL, duration)
+	baseImgHash := fmt.Sprintf("%x", sha1.Sum([]byte(baseImgKey)))
+	baseCacheDir := filepath.Join(e.outputDir, "base_cache")
+	_ = os.MkdirAll(baseCacheDir, 0755)
+	baseImagePath := filepath.Join(baseCacheDir, fmt.Sprintf("base_img_%s.mp4", baseImgHash))
+
+	encodeArgs := []string{"-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-pix_fmt", "yuv420p", "-movflags", "+faststart"}
+
+	var inputArgs []string
+	var videoFilter string
+
+	if stat, err := os.Stat(baseImagePath); err == nil && stat.Size() > 0 {
+		log.Printf("[VideoEngine ⚡] Reutilizando imagen base pre-renderizada en caché (%s)", baseImagePath)
+		inputArgs = []string{"-i", baseImagePath}
+		videoFilter = strings.Join([]string{
+			e.categoryHeaderFilters(req.Category, lo),
+			e.buildHeadlineDrawtext(cleanHeadline, lo),
+		}, ",")
+	} else {
+		// Primera vez: renderizar base animada con coverImageFilter a baseImagePath
+		tempBaseImgPath := filepath.Join(baseCacheDir, fmt.Sprintf("base_img_%s_%s.tmp.mp4", baseImgHash, job.ID))
+		defer os.Remove(tempBaseImgPath)
+		prepArgs := []string{
+			"-y",
+			"-loop", "1", "-t", fmt.Sprintf("%d", duration),
+			"-i", localImagePath,
+			"-filter_complex", "[0:v]" + coverImageFilter(duration) + ",fps=30,format=yuv420p[out]",
+			"-map", "[out]",
+			"-c:v", "libx264", "-preset", "ultrafast", "-threads", "0",
+			"-pix_fmt", "yuv420p", "-an",
+			tempBaseImgPath,
+		}
+		cmdPrep := exec.CommandContext(ctx, e.ffmpegPath, prepArgs...)
+		if _, err := cmdPrep.CombinedOutput(); err == nil {
+			_ = os.Rename(tempBaseImgPath, baseImagePath)
+			inputArgs = []string{"-i", baseImagePath}
+			videoFilter = strings.Join([]string{
+				e.categoryHeaderFilters(req.Category, lo),
+				e.buildHeadlineDrawtext(cleanHeadline, lo),
+			}, ",")
+		} else {
+			inputArgs = []string{"-loop", "1", "-t", fmt.Sprintf("%d", duration), "-i", localImagePath}
+			videoFilter = strings.Join([]string{
+				coverImageFilter(duration),
+				e.categoryHeaderFilters(req.Category, lo),
+				e.buildHeadlineDrawtext(cleanHeadline, lo),
+			}, ",")
+		}
+	}
 
 	args := e.buildRenderArgs(inputArgs, videoFilter, outputPath, encodeArgs, duration, lo)
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
@@ -533,6 +762,67 @@ func (e *Engine) renderImageZoomVideo(ctx context.Context, job *models.VideoJob,
 // renderFallbackImageVideo: compat — anima la imagen destacada de la noticia.
 func (e *Engine) renderFallbackImageVideo(ctx context.Context, job *models.VideoJob, outputPath string) error {
 	return e.renderImageZoomVideo(ctx, job, outputPath, job.Request.ImageURL, job.Request.DurationSec)
+}
+
+// getOrDownloadMedia descarga una URL a una carpeta de caché persistente (outputDir/media_cache)
+// usando sha1(url) + extensión. Si el archivo ya existe y tiene tamaño > 0,
+// se devuelve directamente SIN descargar por red (0 ms).
+func (e *Engine) getOrDownloadMedia(ctx context.Context, mediaURL, ext string, timeout time.Duration) (string, error) {
+	cacheDir := filepath.Join(e.outputDir, "media_cache")
+	_ = os.MkdirAll(cacheDir, 0755)
+
+	h := sha1.New()
+	h.Write([]byte(mediaURL))
+	cachedFile := filepath.Join(cacheDir, hex.EncodeToString(h.Sum(nil))+ext)
+
+	if stat, err := os.Stat(cachedFile); err == nil && stat.Size() > 0 {
+		return cachedFile, nil
+	}
+
+	tmpFile, err := os.CreateTemp(cacheDir, "dl_*"+ext)
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmpFile.Name()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, mediaURL, nil)
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", err
+	}
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("status HTTP %d al descargar %s", resp.StatusCode, mediaURL)
+	}
+
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", err
+	}
+	tmpFile.Close()
+
+	if err := os.Rename(tmpPath, cachedFile); err != nil {
+		if stat, statErr := os.Stat(cachedFile); statErr == nil && stat.Size() > 0 {
+			os.Remove(tmpPath)
+			return cachedFile, nil
+		}
+		return tmpPath, nil
+	}
+
+	return cachedFile, nil
 }
 
 // downloadToTempFile descarga una URL a un archivo temporal en outputDir y
@@ -623,18 +913,29 @@ func downloadFileTo(url, dest string) error {
 // imagen destacada: un video de color de marca con el titular quemado.
 func (e *Engine) renderFallbackColorVideo(ctx context.Context, job *models.VideoJob, outputPath string) error {
 	req := job.Request
-	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(req.Headline), headlineMaxCharsPerLine, headlineMaxLines)
 	duration := req.DurationSec
 	if duration <= 0 {
 		duration = 12
 	}
 	lo := layoutFor(req.Template)
-	lo.promoY = computePromoY(lo, cleanHeadline, 40)
+	lo.boxColor, lo.boxOpacity = "black", 0.78
+	lo.headFontSize, lo.headColor, lo.headX = 40, "white", 60
+	lo.showLogo, lo.logoSize, lo.logoX = true, 240, "W-w-60"
+	lo.headFontFile = e.fontFileFor("classic")
+	lo = e.applyStyleOverrides(lo, req.Style)
+
+	headlineText := resolveHeadlineText(req)
+	// Calcular dinámicamente el ancho de línea para que NUNCA se corte por la derecha
+	maxChars := computeMaxCharsPerLine(lo.headFontSize, lo.headX, lo.headFontFile)
+	cleanHeadline := wrapTextForDrawtext(sanitizeTextForFFmpeg(headlineText), maxChars, headlineMaxLines)
+	lo = adjustLayoutForContent(lo, cleanHeadline, lo.headFontSize)
+	if cardPath, err := e.generateRoundedCardPNG(1000, lo.cardH, 32, lo.boxColor, lo.boxOpacity); err == nil {
+		lo.cardImagePath = cardPath
+	}
 
 	videoFilter := strings.Join([]string{
-		fmt.Sprintf("drawbox=y=%s:color=black@0.78:width=iw:height=%s:t=fill", lo.boxY, lo.boxH),
-		fmt.Sprintf("drawtext=text='PRENSA ABIERTA - PUERTO RICO':fontcolor=yellow:fontsize=36:x=60:y=%s:box=1:boxcolor=red@0.9:boxborderw=10", lo.catTextY),
-		fmt.Sprintf("drawtext=text='%s':fontcolor=white:fontsize=40:x=60:y=%s:line_spacing=%d:fix_bounds=true", cleanHeadline, lo.headY, lo.headLineSpacing),
+		fmt.Sprintf("drawtext=text='PRENSA ABIERTA - PUERTO RICO':fontcolor=yellow:fontsize=36:x=60:y=%s:box=1:boxcolor=red@0.9:boxborderw=10%s", lo.catTextY, fontFileClause(lo.headFontFile)),
+		e.buildHeadlineDrawtext(cleanHeadline, lo),
 	}, ",")
 
 	inputArgs := []string{"-f", "lavfi", "-i", fmt.Sprintf("color=c=0x1a1a2e:s=1080x1920:d=%d:r=30", duration)}
@@ -647,6 +948,34 @@ func (e *Engine) renderFallbackColorVideo(ctx context.Context, job *models.Video
 		return fmt.Errorf("error generando video fallback: %v (salida: %s)", err, string(output))
 	}
 	return nil
+}
+
+func resolveHeadlineText(req models.VideoRenderRequest) string {
+	if req.Style != nil && strings.TrimSpace(req.Style.HeadlineText) != "" {
+		return strings.TrimSpace(req.Style.HeadlineText)
+	}
+	return req.Headline
+}
+
+func (e *Engine) buildHeadlineDrawtext(cleanHeadline string, lo overlayLayout) string {
+	var headXExpr string
+	var textAlignOpt string
+	switch lo.headAlign {
+	case "center":
+		headXExpr = "(w-tw)/2"
+		textAlignOpt = ":text_align=center"
+	case "right":
+		headXExpr = fmt.Sprintf("w-tw-%d", lo.headX)
+		textAlignOpt = ":text_align=right"
+	default:
+		headXExpr = fmt.Sprintf("%d", lo.headX)
+		textAlignOpt = ":text_align=left"
+	}
+
+	return fmt.Sprintf(
+		"drawtext=text='%s':expansion=none:fontcolor=%s:fontsize=%d:x=%s:y=%s:line_spacing=%d:fix_bounds=true%s%s",
+		cleanHeadline, lo.headColor, lo.headFontSize, headXExpr, lo.headY, lo.headLineSpacing, textAlignOpt, fontFileClause(lo.headFontFile),
+	)
 }
 
 // buildRenderArgs arma los argumentos de FFmpeg combinando el/los input(s) de video
@@ -684,12 +1013,20 @@ func (e *Engine) buildRenderArgs(inputArgs []string, videoFilter string, outputP
 		promoMargin = 34
 	}
 
-	hasLogo := fileExists(e.defaultLogo)
-	hasPromo := lo.showPromo && fileExists(e.promoImage)
+	hasCard := lo.cardImagePath != "" && fileExists(lo.cardImagePath)
+	hasLogo := lo.showLogo && fileExists(e.defaultLogo)
+	roundedPromo := e.getRoundedPromoImage()
+	hasPromo := lo.showPromo && fileExists(roundedPromo)
 
-	// Posición Y del banner: si computePromoY() pudo calcularla (promoGapBelowHeadline
-	// px debajo de la última línea del titular ya envuelto) se usa ese píxel literal;
-	// si no (plantilla sin headYOffset), se cae al ancla del borde inferior de siempre.
+	logoSize := lo.logoSize
+	if logoSize <= 0 {
+		logoSize = 240
+	}
+	logoX := lo.logoX
+	if logoX == "" {
+		logoX = "W-w-60"
+	}
+
 	promoYExpr := fmt.Sprintf("H-h-%d", promoMargin)
 	if lo.promoY > 0 {
 		promoYExpr = fmt.Sprintf("%d", lo.promoY)
@@ -703,34 +1040,76 @@ func (e *Engine) buildRenderArgs(inputArgs []string, videoFilter string, outputP
 		return []string{"-loop", "1", "-t", fmt.Sprintf("%d", safeDuration), "-i", imgPath}
 	}
 
-	switch {
-	case hasLogo && hasPromo:
-		filterComplex := fmt.Sprintf(
-			"[0:v]%s[vout];"+
-				"[1:v]scale=240:240[logo];"+
-				"[vout][logo]overlay=x=W-w-60:y=%d:shortest=1[vlogo];"+
-				"[2:v]scale=%d:-1[promo];"+
-				"[vlogo][promo]overlay=x=(W-w)/2:y=%s:shortest=1[vfinal]",
-			videoFilter, logoY, promoWidth, promoYExpr,
-		)
+	// Contar los inputs -i que ya vienen en inputArgs
+	nextInputIdx := 0
+	for _, a := range inputArgs {
+		if a == "-i" {
+			nextInputIdx++
+		}
+	}
+
+	var cardIdx, logoIdx, promoIdx int
+	if hasCard {
+		args = append(args, loopInput(lo.cardImagePath)...)
+		cardIdx = nextInputIdx
+		nextInputIdx++
+	}
+	if hasLogo {
 		args = append(args, loopInput(e.defaultLogo)...)
-		args = append(args, loopInput(e.promoImage)...)
-		args = append(args, "-filter_complex", filterComplex, "-map", "[vfinal]")
-	case hasLogo:
-		filterComplex := fmt.Sprintf(
-			"[0:v]%s[vout];[1:v]scale=240:240[logo];[vout][logo]overlay=x=W-w-60:y=%d:shortest=1[vfinal]",
-			videoFilter, logoY,
-		)
-		args = append(args, loopInput(e.defaultLogo)...)
-		args = append(args, "-filter_complex", filterComplex, "-map", "[vfinal]")
-	case hasPromo:
-		filterComplex := fmt.Sprintf(
-			"[0:v]%s[vout];[1:v]scale=%d:-1[promo];[vout][promo]overlay=x=(W-w)/2:y=%s:shortest=1[vfinal]",
-			videoFilter, promoWidth, promoYExpr,
-		)
-		args = append(args, loopInput(e.promoImage)...)
-		args = append(args, "-filter_complex", filterComplex, "-map", "[vfinal]")
-	default:
+		logoIdx = nextInputIdx
+		nextInputIdx++
+	}
+	if hasPromo {
+		args = append(args, loopInput(roundedPromo)...)
+		promoIdx = nextInputIdx
+		nextInputIdx++
+	}
+
+	// Construir filter_complex encadenando cada capa de forma modular
+	var fcParts []string
+	currentStream := "[0:v]"
+
+	// Si videoFilter contiene split= (ej. coverImageFilter de fallback en renderImageZoomVideo)
+	if strings.Contains(videoFilter, "split=") {
+		parts := strings.SplitN(videoFilter, "drawtext=", 2)
+		if len(parts) == 2 {
+			coverPart := strings.TrimSuffix(parts[0], ",")
+			fcParts = append(fcParts, fmt.Sprintf("[0:v]%s[vbase]", coverPart))
+			currentStream = "[vbase]"
+			videoFilter = "drawtext=" + parts[1]
+		}
+	}
+
+	if hasCard {
+		cardY := lo.cardY
+		if cardY <= 0 {
+			cardY = 1300
+		}
+		fcParts = append(fcParts, fmt.Sprintf("%s[%d:v]overlay=x=40:y=%d[vcard]", currentStream, cardIdx, cardY))
+		currentStream = "[vcard]"
+	}
+
+	if videoFilter != "" {
+		fcParts = append(fcParts, fmt.Sprintf("%s%s[vtext]", currentStream, videoFilter))
+		currentStream = "[vtext]"
+	}
+
+	if hasLogo {
+		fcParts = append(fcParts, fmt.Sprintf("[%d:v]scale=%d:%d[logo]", logoIdx, logoSize, logoSize))
+		fcParts = append(fcParts, fmt.Sprintf("%s[logo]overlay=x=%s:y=%d:shortest=1[vlogo]", currentStream, logoX, logoY))
+		currentStream = "[vlogo]"
+	}
+
+	if hasPromo {
+		fcParts = append(fcParts, fmt.Sprintf("[%d:v]scale=%d:-1[promo]", promoIdx, promoWidth))
+		fcParts = append(fcParts, fmt.Sprintf("%s[promo]overlay=x=(W-w)/2:y=%s:shortest=1[vfinal]", currentStream, promoYExpr))
+		currentStream = "[vfinal]"
+	}
+
+	if len(fcParts) > 0 {
+		filterComplex := strings.Join(fcParts, ";")
+		args = append(args, "-filter_complex", filterComplex, "-map", currentStream)
+	} else if videoFilter != "" {
 		args = append(args, "-vf", videoFilter)
 	}
 
@@ -752,19 +1131,41 @@ func fileExists(path string) bool {
 // poder cambiarlas según la plantilla elegida (models.VideoRenderRequest.Template)
 // sin duplicar la lógica en los 3 modos de render.
 type overlayLayout struct {
-	boxY, boxH        string // ej. "ih-520", "520"
-	catDotY, catTextY string // ej. "h-441", "h-440"
-	headY             string // ej. "h-370"
-	headYOffset       int    // mismo valor que headY pero numérico (distancia en px desde el borde inferior del lienzo de 1920px) — permite calcular dónde termina el titular para ubicar el banner promocional con un espaciado exacto.
+	boxY, boxH        string  // ej. "ih-520", "520"
+	boxColor          string  // color del drawbox de fondo, ej. "black" o "0xRRGGBB" (override de VideoStyle.BoxColor)
+	boxOpacity        float64 // opacidad 0-1 del drawbox, ej. 0.85 (override de VideoStyle.BoxOpacity)
+	catDotY, catTextY string  // ej. "h-441", "h-440"
+	headerText        string  // "" = auto (buildCategoryHeader(category)); override de VideoStyle.HeaderText
+	headerColor       string  // color del rótulo + punto pulsante, default categoryHeaderColor
+	headY             string  // ej. "h-370"
+	headYOffset       int     // mismo valor que headY pero numérico (distancia en px desde el borde inferior del lienzo de 1920px) — permite calcular dónde termina el titular para ubicar el banner promocional con un espaciado exacta.
 	headLineSpacing   int
+	headFontSize      int    // tamaño del titular (drawtext fontsize); default headlineFontSize (46) o 40 en el fallback de color
+	headFontFile      string // ruta absoluta al .ttf del titular; "" = sin fontfile (fuente del sistema, comportamiento actual)
+	headColor         string // color del titular (fontcolor), default "white"
+	headX             int    // posición X del titular, default 70 (60 en el fallback de color)
+	headAlign         string // alineación del titular: "left", "center", "right"
 	logoY             int
+	showLogo          bool   // si se debe pintar el logo (antes: implícito por fileExists); default true, override de VideoStyle.ShowLogo
+	logoSize          int    // tamaño (cuadrado, px) del logo; default 240, override de VideoStyle.LogoSize
+	logoX             string // expresión FFmpeg de posición X del logo; default "W-w-60" (ancla superior derecha), override de VideoStyle.LogoX (px absolutos desde la izquierda)
 
 	// Banner "Descarga la App GRATIS" (assets/logos/descargar-app-gratis.jpg),
-	// centrado horizontalmente. Solo lo usa la plantilla "app-promo".
+	// centrado horizontalmente. Solo lo usa la plantilla "app-promo" por defecto;
+	// VideoStyle.ShowPromo puede forzarlo on/off en cualquier plantilla.
 	showPromo         bool
 	promoWidth        int // ancho al que se escala (alto = automático, mantiene aspecto)
 	promoBottomMargin int // fallback: anclado al borde inferior si no se pudo calcular promoY
-	promoY            int // posición Y calculada (computePromoY): promoGapBelowHeadline px debajo de la última línea del titular
+	promoY            int // posición Y calculada
+
+	// Dinamismo & Transiciones entre tomas
+	transition string // "fade", "slide", "fadeblack", "cut"
+	shotCount  int    // 2, 3, 4
+
+	// Tarjeta con esquinas redondeadas (reemplaza drawbox por un overlay PNG idéntico al preview)
+	cardImagePath string
+	cardY         int
+	cardH         int
 }
 
 // canvasHeight es la altura fija del lienzo de salida (1080x1920, 9:16) — todos los
@@ -773,30 +1174,96 @@ type overlayLayout struct {
 // `h` de FFmpeg (que también vale 1920, pero como número no permite aritmética en Go).
 const canvasHeight = 1920
 
-// promoGapBelowHeadline es la separación pedida entre la última línea del titular y
-// el borde superior del banner "Descarga la App GRATIS" (plantilla "app-promo").
-const promoGapBelowHeadline = 16
-
-// computePromoY calcula, en píxeles absolutos, dónde debe empezar el banner
-// promocional para quedar `promoGapBelowHeadline` px debajo de la ÚLTIMA línea del
-// titular ya envuelto (`cleanHeadline`, con saltos de línea reales de
-// wrapTextForDrawtext) — el titular tiene 1 a headlineMaxLines líneas según lo
-// largo que sea, así que esta posición varía por noticia, no es un valor fijo.
-//
-// fontSize + lo.headLineSpacing aproxima el "line pitch" real que usa drawtext
-// (altura de línea de DejaVu Sans Bold al fontsize del titular + el interlineado
-// explícito de la plantilla) — calibrado visualmente con Docker real. Se recibe
-// `fontSize` porque el titular no usa siempre el mismo tamaño: 46 en el render con
-// clips/imagen, 40 en el fallback de color de marca.
-func computePromoY(lo overlayLayout, cleanHeadline string, fontSize int) int {
-	if !lo.showPromo || lo.headYOffset <= 0 {
-		return 0
-	}
+// adjustLayoutForContent calcula las posiciones exactas de forma determinista y reactiva
+// siguiendo el mismo flujo de contenido que CSS (padding superior -> rótulo -> espacio -> titular -> espacio -> banner -> padding inferior).
+// Garantiza que la tarjeta envuelva TODO el contenido con márgenes interiores simétricos (28px arriba y abajo),
+// que el banner promocional NUNCA se corte ni toque el borde inferior, y que la tarjeta flote con margen seguro (70px).
+func adjustLayoutForContent(lo overlayLayout, cleanHeadline string, fontSize int) overlayLayout {
 	lines := strings.Count(cleanHeadline, "\n") + 1
-	linePitch := fontSize + lo.headLineSpacing
-	headlineTop := canvasHeight - lo.headYOffset
-	headlineBottom := headlineTop + lines*linePitch
-	return headlineBottom + promoGapBelowHeadline
+	// En FreeType / drawtext, el interlineado real entre líneas consecutivas es
+	// ascender + descender (~1.25 * fontSize) + line_spacing.
+	linePitch := int(float64(fontSize)*1.25) + lo.headLineSpacing
+	// Altura real del bloque de titular desde la parte superior de la primera línea
+	// hasta la parte inferior de los descendentes de la última línea:
+	headlineH := (lines-1)*linePitch + int(float64(fontSize)*1.20)
+	if lines == 1 {
+		headlineH = int(float64(fontSize) * 1.20)
+	}
+
+	// Dimensiones interiores de la tarjeta idénticas a las clases CSS del preview
+	const (
+		cardPaddingV          = 32 // padding vertical superior e inferior
+		categoryH             = 36 // altura del rótulo 'ULTIMA HORA • CATEGORIA'
+		categoryToHeadlineGap = 20 // separación entre rótulo y titular
+		headlineToPromoGap    = 32 // separación amplia y limpia entre titular y banner promocional
+	)
+
+	// Margen inferior seguro entre la base de la tarjeta y el borde inferior del lienzo
+	cardBottomMargin := 70 // 70px deja espacio para el time indicator y el borde del mockup
+	if lo.promoBottomMargin > 0 {
+		cardBottomMargin = lo.promoBottomMargin
+	}
+	// Si está en plantilla reels-safe, proteger la zona UI inferior de Reels (360px)
+	if strings.Contains(lo.boxY, "ih-8") || strings.Contains(lo.boxY, "ih-7") || lo.headYOffset >= 650 {
+		if cardBottomMargin < 360 {
+			cardBottomMargin = 360
+		}
+	}
+
+	promoHeight := 0
+	if lo.showPromo {
+		pWidth := lo.promoWidth
+		if pWidth <= 0 {
+			pWidth = 560
+		}
+		promoHeight = int(float64(pWidth) * (1058.0 / 4492.0))
+		if promoHeight < 60 {
+			promoHeight = 132
+		}
+	}
+
+	// Altura total de la tarjeta derivada naturalmente de su contenido (como flex-col en CSS)
+	var cardH int
+	if lo.showPromo {
+		cardH = cardPaddingV + categoryH + categoryToHeadlineGap + headlineH + headlineToPromoGap + promoHeight + cardPaddingV
+	} else {
+		cardH = cardPaddingV + categoryH + categoryToHeadlineGap + headlineH + cardPaddingV
+	}
+
+	// Posición de la tarjeta anclada al margen inferior seguro
+	cardBottom := canvasHeight - cardBottomMargin
+	cardTop := cardBottom - cardH
+	if cardTop < 60 {
+		cardTop = 60
+		cardH = cardBottom - cardTop
+	}
+
+	// Posiciones verticales relativas exactas de cada elemento
+	categoryTop := cardTop + cardPaddingV
+	lo.catTextY = fmt.Sprintf("%d", categoryTop)
+	lo.catDotY = fmt.Sprintf("%d", categoryTop+6)
+
+	headlineTop := categoryTop + categoryH + categoryToHeadlineGap
+	lo.headY = fmt.Sprintf("%d", headlineTop)
+	lo.headYOffset = canvasHeight - headlineTop
+
+	if lo.showPromo {
+		promoTop := headlineTop + headlineH + headlineToPromoGap
+		lo.promoY = promoTop
+	} else {
+		lo.promoY = 0
+	}
+
+	lo.boxY = fmt.Sprintf("%d", cardTop)
+	lo.boxH = fmt.Sprintf("%d", cardH)
+	lo.cardY = cardTop
+	lo.cardH = cardH
+
+	return lo
+}
+
+func computePromoY(lo overlayLayout, cleanHeadline string, fontSize int) int {
+	return lo.promoY
 }
 
 // layoutFor traduce el nombre de plantilla a coordenadas concretas de overlay.
@@ -850,6 +1317,397 @@ func layoutFor(template string) overlayLayout {
 	}
 }
 
+// hexColorPattern valida un color "#RRGGBB" o "RRGGBB" (6 hex digits, con o sin #).
+var hexColorPattern = regexp.MustCompile(`^#?([0-9A-Fa-f]{6})$`)
+
+// sanitizeHexColor valida y normaliza un color hex de VideoStyle a "RRGGBB"
+// (mayúsculas, sin "#"). Devuelve "" si el valor no es un hex válido — así un
+// override malformado simplemente se ignora (se mantiene el default) en vez de
+// romper el filtro de FFmpeg.
+func sanitizeHexColor(v string) string {
+	m := hexColorPattern.FindStringSubmatch(strings.TrimSpace(v))
+	if m == nil {
+		return ""
+	}
+	return strings.ToUpper(m[1])
+}
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func clampFloat(v, min, max float64) float64 {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// escapeFontFilePath adapta una ruta de archivo (incluyendo rutas Windows con
+// letra de unidad, ej. "C:\...") al formato que espera el parámetro `fontfile`
+// del filtro drawtext de FFmpeg: barras `/` (nunca `\`) y el `:` de la unidad
+// escapado como `\:` (el filtro usa `:` como separador de opciones).
+func escapeFontFilePath(path string) string {
+	p := filepath.ToSlash(path)
+	return strings.ReplaceAll(p, ":", "\\:")
+}
+
+// fontFileClause devuelve la cláusula `:fontfile='...'` lista para concatenar a
+// un `drawtext=...`, o "" si path viene vacío (sin override de fuente: se deja
+// que FFmpeg use la fuente por defecto de fontconfig, comportamiento actual).
+func fontFileClause(path string) string {
+	if path == "" {
+		return ""
+	}
+	return fmt.Sprintf(":fontfile='%s'", escapeFontFilePath(path))
+}
+
+// fontFileFor resuelve la clave de fuente elegida en el Editor de video
+// (VideoStyle.HeadlineFont) a una ruta de archivo .ttf bajo assetsDir/fonts.
+// "league_spartan" resuelve a League Spartan Bold; cualquier otro valor
+// (incluyendo "classic", vacío, o desconocido) resuelve al DejaVu Sans Bold
+// bundleado — el look "clásico" original que antes se dejaba en manos de
+// Fontconfig para resolver la fuente default del sistema.
+//
+// Se resuelve SIEMPRE a un archivo en disco (nunca "" salvo que falten ambos
+// assets) a propósito: en Windows, cuando Fontconfig no tiene un fonts.conf
+// válido (`Fontconfig error: Cannot load default config file`), el filtro
+// `drawtext` sin `fontfile=` no solo falla — puede crashear FFmpeg entero
+// (exit status 0xc0000005, access violation) en vez de solo loguear un error.
+// Pasar siempre un `fontfile=` evita que drawtext dependa de Fontconfig.
+func (e *Engine) fontFileFor(key string) string {
+	if key == "league_spartan" {
+		path := filepath.Join(e.assetsDir, "fonts", "League_Spartan", "LeagueSpartan-Bold.ttf")
+		if fileExists(path) {
+			return path
+		}
+	}
+	classicPath := filepath.Join(e.assetsDir, "fonts", "DejaVu", "DejaVuSans-Bold.ttf")
+	if fileExists(classicPath) {
+		return classicPath
+	}
+	// Fallbacks adicionales si e.assetsDir no apunta a la carpeta assets correcta
+	for _, candidate := range []string{
+		filepath.Join("assets", "fonts", "DejaVu", "DejaVuSans-Bold.ttf"),
+		filepath.Join("..", "assets", "fonts", "DejaVu", "DejaVuSans-Bold.ttf"),
+		filepath.Join("..", "..", "assets", "fonts", "DejaVu", "DejaVuSans-Bold.ttf"),
+	} {
+		if fileExists(candidate) {
+			return candidate
+		}
+	}
+	// En Windows, si no se encuentra la fuente bundleada, usar fuentes TrueType estándar del sistema
+	// para evitar que Fontconfig falle y FFmpeg crashee con 0xc0000005:
+	if windir := os.Getenv("WINDIR"); windir != "" {
+		for _, name := range []string{"arialbd.ttf", "arial.ttf", "segoeuib.ttf", "segoeui.ttf"} {
+			sysFont := filepath.Join(windir, "Fonts", name)
+			if fileExists(sysFont) {
+				return sysFont
+			}
+		}
+	}
+	return ""
+}
+
+// generateRoundedCardPNG genera una imagen PNG con esquinas redondeadas y borde de acento
+// idéntico al estilo rounded-2xl border de la tarjeta en el preview web (HTML/CSS).
+// Se guarda en cacheDir/card_{hash}.png para que solo se genere una vez por combinación de dimensiones y colores.
+func (e *Engine) generateRoundedCardPNG(width, height, radius int, bgColorHex string, bgOpacity float64) (string, error) {
+	if width <= 0 {
+		width = 1000
+	}
+	if height <= 0 {
+		height = 400
+	}
+	if radius <= 0 {
+		radius = 32
+	}
+
+	cardCacheDir := filepath.Join(e.outputDir, "card_cache")
+	_ = os.MkdirAll(cardCacheDir, 0755)
+
+	hashKey := fmt.Sprintf("%d_%d_%d_%s_%.2f", width, height, radius, bgColorHex, bgOpacity)
+	hash := fmt.Sprintf("%x", sha1.Sum([]byte(hashKey)))
+	cardPath := filepath.Join(cardCacheDir, fmt.Sprintf("card_%s.png", hash))
+
+	if fileExists(cardPath) {
+		return cardPath, nil
+	}
+
+	// Parse background color (default black #000000)
+	bgR, bgG, bgB := uint8(0), uint8(0), uint8(0)
+	cleanHex := strings.TrimPrefix(strings.TrimPrefix(bgColorHex, "0x"), "#")
+	if len(cleanHex) >= 6 {
+		var r, g, b int
+		fmt.Sscanf(cleanHex[0:2], "%x", &r)
+		fmt.Sscanf(cleanHex[2:4], "%x", &g)
+		fmt.Sscanf(cleanHex[4:6], "%x", &b)
+		bgR, bgG, bgB = uint8(r), uint8(g), uint8(b)
+	}
+	bgA := uint8(clampFloat(bgOpacity, 0, 1) * 255)
+
+	// Borde de marca Prensa Abierta: rgba(255, 85, 0, 0.38)
+	borderR, borderG, borderB, borderA := uint8(255), uint8(85), uint8(0), uint8(98)
+	borderWidth := 2.5
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	r := float64(radius)
+	w := float64(width)
+	h := float64(height)
+	bw := borderWidth
+
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			fx := float64(x) + 0.5
+			fy := float64(y) + 0.5
+
+			var dx, dy float64
+			if fx < r {
+				dx = r - fx
+			} else if fx > w-r {
+				dx = fx - (w - r)
+			}
+			if fy < r {
+				dy = r - fy
+			} else if fy > h-r {
+				dy = fy - (h - r)
+			}
+
+			dist := math.Hypot(dx, dy)
+			if dist <= r {
+				if dist > r-bw || fx < bw || fx > w-bw || fy < bw || fy > h-bw {
+					img.SetRGBA(x, y, color.RGBA{R: borderR, G: borderG, B: borderB, A: borderA})
+				} else {
+					img.SetRGBA(x, y, color.RGBA{R: bgR, G: bgG, B: bgB, A: bgA})
+				}
+			} else if dist <= r+1.0 {
+				alpha := (1.0 - (dist - r)) * (float64(borderA) / 255.0)
+				img.SetRGBA(x, y, color.RGBA{R: borderR, G: borderG, B: borderB, A: uint8(alpha * 255)})
+			}
+		}
+	}
+
+	tmpPath := fmt.Sprintf("%s.tmp.png", cardPath)
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return "", err
+	}
+	if err := png.Encode(f, img); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return "", err
+	}
+	f.Close()
+	_ = os.Rename(tmpPath, cardPath)
+
+	return cardPath, nil
+}
+
+// getRoundedPromoImage devuelve la ruta a una versión de descargar-app-gratis con esquinas redondeadas
+// (radio 16px y borde sutil), idéntica a la clase rounded-lg border border-white/20 de CSS.
+func (e *Engine) getRoundedPromoImage() string {
+	if !fileExists(e.promoImage) {
+		return ""
+	}
+	cacheDir := filepath.Join(e.outputDir, "card_cache")
+	_ = os.MkdirAll(cacheDir, 0755)
+	roundedPath := filepath.Join(cacheDir, "promo_rounded.png")
+	if fileExists(roundedPath) {
+		return roundedPath
+	}
+
+	file, err := os.Open(e.promoImage)
+	if err != nil {
+		return e.promoImage
+	}
+	defer file.Close()
+
+	src, _, err := image.Decode(file)
+	if err != nil {
+		return e.promoImage
+	}
+
+	bounds := src.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+	radius := 64.0 // En imagen nativa de 4492x1058, 64px equivale a ~16px cuando se escala a 560px
+	bw := 5.0
+
+	out := image.NewRGBA(image.Rect(0, 0, w, h))
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			fx := float64(x) + 0.5
+			fy := float64(y) + 0.5
+
+			var dx, dy float64
+			if fx < radius {
+				dx = radius - fx
+			} else if fx > float64(w)-radius {
+				dx = fx - (float64(w) - radius)
+			}
+			if fy < radius {
+				dy = radius - fy
+			} else if fy > float64(h)-radius {
+				dy = fy - (float64(h) - radius)
+			}
+
+			dist := math.Hypot(dx, dy)
+			if dist <= radius {
+				c := src.At(bounds.Min.X+x, bounds.Min.Y+y)
+				if dist > radius-bw || fx < bw || fx > float64(w)-bw || fy < bw || fy > float64(h)-bw {
+					out.SetRGBA(x, y, color.RGBA{R: 255, G: 255, B: 255, A: 60})
+				} else {
+					out.Set(x, y, c)
+				}
+			} else if dist <= radius+1.0 {
+				alpha := (1.0 - (dist - radius)) * (60.0 / 255.0)
+				out.SetRGBA(x, y, color.RGBA{R: 255, G: 255, B: 255, A: uint8(alpha * 255)})
+			}
+		}
+	}
+
+	tmpPath := fmt.Sprintf("%s.tmp.png", roundedPath)
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return e.promoImage
+	}
+	if err := png.Encode(f, out); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return e.promoImage
+	}
+	f.Close()
+	_ = os.Rename(tmpPath, roundedPath)
+	return roundedPath
+}
+
+// applyStyleOverrides sobreescribe, campo por campo, los valores de lo con los
+// que vengan en style — nil, "", 0 o false-no-explícito (los *bool solo se leen
+// si son no-nil) significan "no tocar", se mantiene el default ya puesto por el
+// caller (layoutFor + los defaults propios de cada modo de render). Así, un
+// VideoRenderRequest.Style ausente o parcial rinde igual que antes de esta
+// feature. Todos los valores numéricos/color se clampan a rangos seguros para
+// que un payload fuera de rango nunca rompa el filtro de FFmpeg ni produzca
+// coordenadas fuera del lienzo 1080x1920.
+func (e *Engine) applyStyleOverrides(lo overlayLayout, style *models.VideoStyle) overlayLayout {
+	if style == nil {
+		return lo
+	}
+	if style.HeadlineFont != "" {
+		lo.headFontFile = e.fontFileFor(style.HeadlineFont)
+	}
+	if style.HeadlineFontSize > 0 {
+		lo.headFontSize = clampInt(style.HeadlineFontSize, 24, 72)
+	}
+	if c := sanitizeHexColor(style.HeadlineColor); c != "" {
+		lo.headColor = "0x" + c
+	}
+	if style.HeadlineX > 0 {
+		lo.headX = clampInt(style.HeadlineX, 0, 1080)
+	}
+	if style.HeadlineY > 0 {
+		offset := clampInt(style.HeadlineY, 100, 1800)
+		lo.headYOffset = offset
+		lo.headY = fmt.Sprintf("h-%d", offset)
+	}
+	if style.HeadlineLineSpacing > 0 {
+		lo.headLineSpacing = clampInt(style.HeadlineLineSpacing, 0, 60)
+	}
+	if style.HeadlineAlign != "" {
+		align := strings.ToLower(strings.TrimSpace(style.HeadlineAlign))
+		if align == "center" || align == "centre" {
+			lo.headAlign = "center"
+		} else if align == "right" {
+			lo.headAlign = "right"
+		} else {
+			lo.headAlign = "left"
+		}
+	}
+	if c := sanitizeHexColor(style.BoxColor); c != "" {
+		lo.boxColor = "0x" + c
+	}
+	if style.BoxOpacity > 0 {
+		lo.boxOpacity = clampFloat(style.BoxOpacity, 0, 1)
+	}
+	if style.BoxHeight > 0 {
+		h := clampInt(style.BoxHeight, 100, 1920)
+		lo.boxH = fmt.Sprintf("%d", h)
+		lo.boxY = fmt.Sprintf("ih-%d", h)
+	}
+	if style.HeaderText != "" {
+		lo.headerText = sanitizeTextForFFmpeg(style.HeaderText)
+	}
+	if c := sanitizeHexColor(style.HeaderColor); c != "" {
+		lo.headerColor = "0x" + c
+	}
+	if style.ShowLogo != nil {
+		lo.showLogo = *style.ShowLogo
+	}
+	if style.LogoSize > 0 {
+		lo.logoSize = clampInt(style.LogoSize, 60, 500)
+	}
+	if style.LogoX > 0 {
+		lo.logoX = fmt.Sprintf("%d", clampInt(style.LogoX, 0, 1080))
+	}
+	if style.LogoY > 0 {
+		lo.logoY = clampInt(style.LogoY, 0, 1920)
+	}
+	if style.ShowPromo != nil {
+		lo.showPromo = *style.ShowPromo
+	}
+	if style.PromoWidth > 0 {
+		lo.promoWidth = clampInt(style.PromoWidth, 200, 1080)
+	}
+	if style.Transition != "" {
+		lo.transition = style.Transition
+	}
+	if style.ShotCount > 0 {
+		lo.shotCount = clampInt(style.ShotCount, 1, 5)
+	}
+	return lo
+}
+
+// StyleDefaultsFor devuelve, para el template dado, los valores de estilo por
+// defecto que hoy usan executeFFmpegRender/renderImageZoomVideo ANTES de
+// cualquier override — así el Editor de video (frontend) puede precargar sus
+// controles con los valores reales de cada plantilla, sin duplicar constantes
+// en TypeScript. No requiere una instancia de Engine (no resuelve rutas de
+// fuente en disco): el frontend solo necesita los NÚMEROS/colores de partida.
+func StyleDefaultsFor(template string) models.VideoStyle {
+	lo := layoutFor(template)
+	showLogo := true
+	showPromo := lo.showPromo
+	return models.VideoStyle{
+		HeadlineFont:        "classic",
+		HeadlineFontSize:    headlineFontSize,
+		HeadlineColor:       "#FFFFFF",
+		HeadlineX:           80,
+		HeadlineY:           lo.headYOffset,
+		HeadlineLineSpacing: lo.headLineSpacing,
+		HeadlineAlign:       "left",
+		BoxColor:            "#000000",
+		BoxOpacity:          0.85,
+		HeaderColor:         "#FFAA00",
+		ShowLogo:            &showLogo,
+		LogoSize:            240,
+		LogoY:               lo.logoY,
+		ShowPromo:           &showPromo,
+		PromoWidth:          560,
+		Transition:          "fade",
+		ShotCount:           3,
+	}
+}
+
 // buildCategoryHeader arma el rótulo pequeño mostrado arriba del titular.
 func buildCategoryHeader(category string) string {
 	if category == "" {
@@ -865,73 +1723,160 @@ const categoryHeaderColor = "0xFFAA00"
 // precedido de un punto (●) que titila en el mismo color, replicando el indicador
 // pulsante que el preview (VideoPlayerPreview.tsx) dibuja a la izquierda de
 // "ÚLTIMA HORA". El alpha del punto oscila ~0.2→1.0 una vez por segundo (abs(sin)).
-func categoryHeaderFilters(category string, lo overlayLayout) string {
+func (e *Engine) categoryHeaderFilters(category string, lo overlayLayout) string {
+	color := lo.headerColor
+	if color == "" {
+		color = categoryHeaderColor
+	}
+	headerText := lo.headerText
+	if headerText == "" {
+		headerText = buildCategoryHeader(category)
+	}
+	fontClause := fontFileClause(lo.headFontFile)
+	// Para el punto (●) usar SIEMPRE la fuente clásica (DejaVu Sans) que contiene los glifos geométricos Unicode,
+	// evitando que fuentes como League Spartan muestren un glifo faltante '▯':
+	classicFontClause := fontFileClause(e.fontFileFor("classic"))
+
+	if lo.headAlign == "center" {
+		return fmt.Sprintf(
+			"drawtext=text='%s':expansion=none:fontcolor=%s:fontsize=34:x=(w-tw)/2:y=%s%s",
+			sanitizeTextForFFmpeg(headerText), color, lo.catTextY, fontClause,
+		)
+	}
+
+	dotX := lo.headX
+	if dotX <= 0 {
+		dotX = 70
+	}
+	textX := dotX + 46
 	dot := fmt.Sprintf(
-		"drawtext=text='●':fontcolor=%s:fontsize=26:x=70:y=%s:alpha='0.2+0.8*abs(sin(PI*t))'",
-		categoryHeaderColor, lo.catDotY,
+		"drawtext=text='●':fontcolor=%s:fontsize=26:x=%d:y=%s:alpha='0.2+0.8*abs(sin(PI*t))'%s",
+		color, dotX, lo.catDotY, classicFontClause,
 	)
 	text := fmt.Sprintf(
-		"drawtext=text='%s':fontcolor=%s:fontsize=36:x=116:y=%s",
-		buildCategoryHeader(category), categoryHeaderColor, lo.catTextY,
+		"drawtext=text='%s':expansion=none:fontcolor=%s:fontsize=36:x=%d:y=%s%s",
+		sanitizeTextForFFmpeg(headerText), color, textX, lo.catTextY, fontClause,
 	)
 	return dot + "," + text
 }
 
 const (
-	// Ancho de línea del titular antes de forzar salto de línea. drawtext de FFmpeg
-	// no hace wrap solo, así que wrapTextForDrawtext corta por conteo de caracteres.
-	// 38 está calibrado midiendo el render real: lienzo de 1080px, margen izquierdo
-	// x=70; con DejaVu Sans Bold a fontsize 46 el ancho medio por carácter ronda los
-	// ~24px, así que ~38 caracteres llegan a ~910px y dejan ~100px de aire a la
-	// derecha sin tocar el borde. El valor previo (28) cortaba demasiado pronto y
-	// dejaba un hueco grande a la derecha.
-	headlineMaxCharsPerLine = 38
-	headlineMaxLines        = 4
-	// Tamaño de fuente del titular en los 3 modos de render (drawtext fontsize=46).
-	// Se reutiliza en computePromoY para estimar el alto de línea real.
+	// Ancho de línea por defecto del titular para wrapTextForDrawtext cuando no se conoce el tamaño.
+	headlineMaxCharsPerLine = 34
+	headlineMaxLines        = 6 // Permite hasta 6 líneas con fuentes grandes (60-72px) para que NUNCA se corte el titular
+	// Tamaño de fuente del titular por defecto en los 3 modos de render.
 	headlineFontSize = 46
 )
 
+// computeMaxCharsPerLine calcula el límite seguro de caracteres por línea según el
+// tamaño de fuente (fontSize), el margen horizontal izquierdo (x) y la fuente en uso
+// (fontFile), garantizando que NINGUNA línea se desborde ni se corte por el borde
+// derecho en un lienzo de 1080px. La fuente determina el factor de ancho medio por
+// carácter: League Spartan (condensada display) necesita ~0.55x mientras que DejaVu
+// Sans Bold necesita ~0.62x.
+func computeMaxCharsPerLine(fontSize, x int, fontFile string) int {
+	if x <= 0 {
+		x = 80
+	}
+	// Margen derecho: igual que el padding derecho de la caja en el preview (34px)
+	// más el margen exterior (40px) = 74px.
+	rightMargin := 74
+	if x > rightMargin {
+		rightMargin = x
+	}
+	usableWidth := 1080 - x - rightMargin
+	if usableWidth < 380 {
+		usableWidth = 380
+	}
+
+	// Factor de ancho medio por carácter según la fuente, calibrado empíricamente
+	// para que el wrapping manual produzca las MISMAS líneas que CSS (break-words
+	// en el preview del browser a 1080px de ancho de lienzo).
+	factor := 0.58 // default para fuentes sans-serif bold genéricas
+	if strings.Contains(strings.ToLower(fontFile), "leaguespartan") {
+		factor = 0.52 // League Spartan Bold es condensada, caracteres más estrechos
+	} else if strings.Contains(strings.ToLower(fontFile), "dejavu") ||
+		strings.Contains(strings.ToLower(fontFile), "arial") {
+		factor = 0.58 // DejaVu Sans Bold / Arial Bold: ancho medio estándar
+	}
+
+	avgCharWidth := float64(fontSize) * factor
+	if avgCharWidth <= 0 {
+		avgCharWidth = 28
+	}
+
+	chars := int(float64(usableWidth) / avgCharWidth)
+	if chars < 15 {
+		chars = 15
+	}
+	if chars > 42 {
+		chars = 42
+	}
+	return chars
+}
+
 // sanitizeTextForFFmpeg escapa caracteres especiales del filtro drawtext (comillas,
-// dos puntos, porcentaje) y colapsa saltos de línea que vengan del texto original.
-// El salto de línea REAL para mostrar el titular en varias líneas se agrega después
-// con wrapTextForDrawtext — antes esta función truncaba a 90 caracteres con "...",
-// lo que cortaba titulares largos a la mitad en vez de partirlos en líneas.
+// dos puntos, barras) preservando saltos de línea intencionales (\n).
+// Al usar expansion=none en drawtext, los símbolos como % y { } se tratan de forma literal
+// sin necesidad de reemplazarlos por %%, evitando el error 'Stray %'.
 func sanitizeTextForFFmpeg(text string) string {
+	text = strings.ReplaceAll(text, "\\", "\\\\")
 	text = strings.ReplaceAll(text, "'", "")
 	text = strings.ReplaceAll(text, ":", "\\:")
-	text = strings.ReplaceAll(text, "%", "%%")
 	text = strings.ReplaceAll(text, "\r", "")
-	text = strings.ReplaceAll(text, "\n", " ")
 	return strings.TrimSpace(text)
 }
 
 // wrapTextForDrawtext parte el texto en líneas de máximo maxCharsPerLine caracteres
 // (cortando por palabra completa, nunca a mitad de palabra) para que un titular
-// largo haga salto de línea real en vez de solaparse o cortarse. El filtro drawtext
-// de FFmpeg soporta saltos de línea reales dentro del texto junto con line_spacing.
+// largo haga salto de línea real en vez de solaparse o cortarse. Si el texto ya
+// incluye saltos de línea explícitos (\n), se respetan esos cortes y sólo se
+// subdividen las líneas que aún excedan maxCharsPerLine.
 func wrapTextForDrawtext(text string, maxCharsPerLine, maxLines int) string {
-	words := strings.Fields(text)
-	if len(words) == 0 {
-		return text
+	text = strings.ReplaceAll(text, "\r", "")
+	rawLines := strings.Split(text, "\n")
+	var lines []string
+
+	for _, rawLine := range rawLines {
+		rawTrimmed := strings.TrimSpace(rawLine)
+		if rawTrimmed == "" {
+			continue
+		}
+		words := strings.Fields(rawTrimmed)
+		if len(words) == 0 {
+			continue
+		}
+		current := ""
+		for _, w := range words {
+			// Si una sola palabra es más ancha que toda la línea permitida, partirla limpiamente
+			for len(w) > maxCharsPerLine && maxCharsPerLine > 5 {
+				chunk := w[:maxCharsPerLine-1] + "-"
+				if current != "" {
+					lines = append(lines, current)
+					current = ""
+				}
+				lines = append(lines, chunk)
+				w = w[maxCharsPerLine-1:]
+			}
+
+			candidate := w
+			if current != "" {
+				candidate = current + " " + w
+			}
+			if len(candidate) > maxCharsPerLine && current != "" {
+				lines = append(lines, current)
+				current = w
+			} else {
+				current = candidate
+			}
+		}
+		if current != "" {
+			lines = append(lines, current)
+		}
 	}
 
-	var lines []string
-	current := ""
-	for _, w := range words {
-		candidate := w
-		if current != "" {
-			candidate = current + " " + w
-		}
-		if len(candidate) > maxCharsPerLine && current != "" {
-			lines = append(lines, current)
-			current = w
-		} else {
-			current = candidate
-		}
-	}
-	if current != "" {
-		lines = append(lines, current)
+	if len(lines) == 0 {
+		return text
 	}
 
 	if len(lines) > maxLines {
