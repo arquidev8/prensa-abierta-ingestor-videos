@@ -959,22 +959,18 @@ func resolveHeadlineText(req models.VideoRenderRequest) string {
 
 func (e *Engine) buildHeadlineDrawtext(cleanHeadline string, lo overlayLayout) string {
 	var headXExpr string
-	var textAlignOpt string
 	switch lo.headAlign {
 	case "center":
 		headXExpr = "(w-tw)/2"
-		textAlignOpt = ":text_align=center"
 	case "right":
 		headXExpr = fmt.Sprintf("w-tw-%d", lo.headX)
-		textAlignOpt = ":text_align=right"
 	default:
 		headXExpr = fmt.Sprintf("%d", lo.headX)
-		textAlignOpt = ":text_align=left"
 	}
 
 	return fmt.Sprintf(
-		"drawtext=text='%s':expansion=none:fontcolor=%s:fontsize=%d:x=%s:y=%s:line_spacing=%d:fix_bounds=true%s%s",
-		cleanHeadline, lo.headColor, lo.headFontSize, headXExpr, lo.headY, lo.headLineSpacing, textAlignOpt, fontFileClause(lo.headFontFile),
+		"drawtext=text='%s':expansion=none:fontcolor=%s:fontsize=%d:x=%s:y=%s:line_spacing=%d:fix_bounds=true%s",
+		cleanHeadline, lo.headColor, lo.headFontSize, headXExpr, lo.headY, lo.headLineSpacing, fontFileClause(lo.headFontFile),
 	)
 }
 
